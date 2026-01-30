@@ -3,11 +3,11 @@
 """
 @Author     : Zijun Deng
 @Date       : 1/30/26 1:20 PM
-@File       : solana_monitor.py
+@File       : monitor.py
 @Description: 
 """
 import asyncio
-# services/solana_monitor.py
+# services/monitor.py
 import json
 
 import aiohttp

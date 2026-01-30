@@ -1,53 +1,106 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-@Author     : Zijun Deng
-@Date       : 1/30/26 1:20 PM
 @File       : core/portfolio.py
-@Description: 核心资产管理 (持仓、记账、风控、日报)
+@Description: 核心资产管理 (支持断电记忆/持久化保存)
 """
 import asyncio
-from datetime import datetime
-
+import json
+import os
 import aiohttp
+from datetime import datetime
 
 # 导入配置和工具
 from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI
 from services.notification import send_email_async
 from utils.logger import logger
 
+# 数据文件路径
+DATA_DIR = "data"
+PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+
 
 class PortfolioManager:
     def __init__(self, trader):
         self.trader = trader
-        self.portfolio = {}
-        self.trade_history = []  # 历史交易记录 (用于日报)
+        self.portfolio = {}  # 当前持仓
+        self.trade_history = []  # 历史记录
         self.is_running = True
 
+        # 🔥 初始化时，加载硬盘上的数据
+        self._ensure_data_dir()
+        self._load_data()
+
+    def _ensure_data_dir(self):
+        """ 确保 data 目录存在 """
+        if not os.path.exists(DATA_DIR):
+            os.makedirs(DATA_DIR)
+
+    def _load_data(self):
+        """ 从硬盘加载数据 (恢复记忆) """
+        # 1. 加载持仓
+        if os.path.exists(PORTFOLIO_FILE):
+            try:
+                with open(PORTFOLIO_FILE, 'r', encoding='utf-8') as f:
+                    self.portfolio = json.load(f)
+                logger.info(f"📂 已恢复持仓记忆: {len(self.portfolio)} 个代币")
+            except Exception as e:
+                logger.error(f"❌ 读取持仓文件失败: {e}")
+
+        # 2. 加载历史
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    self.trade_history = json.load(f)
+            except Exception:
+                pass
+
+    def _save_portfolio(self):
+        """ 保存持仓到硬盘 """
+        try:
+            with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.portfolio, f, indent=4)
+        except Exception as e:
+            logger.error(f"❌ 保存持仓失败: {e}")
+
+    def _save_history(self):
+        """ 保存历史到硬盘 """
+        try:
+            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.trade_history, f, indent=4)
+        except Exception as e:
+            logger.error(f"❌ 保存历史失败: {e}")
+
     def _record_history(self, action, token, amount, value_sol):
-        """ 内部方法：记录交易历史 """
-        self.trade_history.append({
+        """ 记录历史并保存 """
+        record = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "action": action,
             "token": token,
             "amount": amount,
             "value_sol": value_sol
-        })
+        }
+        self.trade_history.append(record)
+        self._save_history()  # 立即保存
 
     def add_position(self, token_mint, amount_bought, cost_sol):
         if token_mint not in self.portfolio:
             self.portfolio[token_mint] = {'my_balance': 0, 'cost_sol': 0}
+
         self.portfolio[token_mint]['my_balance'] += amount_bought
         self.portfolio[token_mint]['cost_sol'] += cost_sol
 
-        # 记录历史
+        # 🔥 立即保存到硬盘
+        self._save_portfolio()
+
         self._record_history("BUY", token_mint, amount_bought, cost_sol)
         logger.info(f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']}")
 
     async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
         # 1. 检查持仓
         if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
-            logger.info(f"👀 监测到大佬卖出 {token_mint[:6]}... 但我未持有，跳过。")
+            # 即使内存里没有，也可以查一下钱包(为了极致安全，暂不加，依赖JSON恢复即可)
             return
 
         logger.info(f"👀 监测到大佬卖出 {token_mint[:6]}... 正在计算比例...")
@@ -78,31 +131,37 @@ class PortfolioManager:
         if success:
             self.portfolio[token_mint]['my_balance'] -= amount_to_sell
 
-            # 记录历史
+            # 🔥 更新并保存
+            if self.portfolio[token_mint]['my_balance'] < 100:
+                del self.portfolio[token_mint]
+                logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
+
+            self._save_portfolio()  # 保存
             self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
 
             # 邮件通知
             msg = f"检测到聪明钱卖出，已跟随卖出。\n\n代币: {token_mint}\n数量: {amount_to_sell}\n比例: {sell_ratio:.1%}"
             asyncio.create_task(send_email_async(f"📉 跟随卖出成功: {token_mint[:6]}...", msg))
 
-            if self.portfolio[token_mint]['my_balance'] < 100 and token_mint in self.portfolio:
-                del self.portfolio[token_mint]
-                logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
-
     async def monitor_sync_positions(self):
-        """ 防断网兜底：每20秒检查一次链上状态 """
+        """
+        防断网兜底：每20秒检查一次链上状态
+        这个函数在重启后非常关键！它会读取 portfolio.json 里的币，
+        然后去链上查大佬还在不在。如果大佬在断网期间跑了，这里会立刻触发强平。
+        """
         logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
         while self.is_running:
             if not self.portfolio:
                 await asyncio.sleep(5)
                 continue
 
+            # 复制一份 keys 防止遍历时修改字典报错
             for token_mint in list(self.portfolio.keys()):
                 try:
                     my_data = self.portfolio[token_mint]
                     if my_data['my_balance'] <= 0: continue
 
-                    # 查链上余额
+                    # 查链上余额 (走强制代理的 Trader)
                     sm_balance = await self.trader.get_token_balance(TARGET_WALLET, token_mint)
 
                     # 如果大佬没币了，但我还有，说明漏单了
@@ -117,8 +176,8 @@ class PortfolioManager:
     async def monitor_1000x_profit(self):
         """ 止盈监控 """
         logger.info("💰 收益监控线程已启动...")
-        # trust_env=True 走代理
-        async with aiohttp.ClientSession(trust_env=True) as session:
+        # 注意：这里不需要 session，因为 get_quote 内部自己管理 session
+        async with aiohttp.ClientSession(trust_env=False) as session:
             while self.is_running:
                 if not self.portfolio:
                     await asyncio.sleep(5)
@@ -149,18 +208,22 @@ class PortfolioManager:
             token_mint, self.trader.SOL_MINT, amount, SLIPPAGE_SELL
         )
         if success:
+            # 清理状态
+            if token_mint in self.portfolio:
+                del self.portfolio[token_mint]
+
+            # 🔥 立即保存
+            self._save_portfolio()
             self._record_history("SELL_FORCE", token_mint, amount, est_sol_out)
 
             if roi == -0.99:
                 subject = f"🛡️ 防断网风控: {token_mint[:6]}..."
-                msg = f"检测到聪明钱已清仓，机器人已补救卖出。\n\n代币: {token_mint}"
+                msg = f"检测到聪明钱已清仓(可能机器人曾中断)，已补救卖出。\n\n代币: {token_mint}"
             else:
                 subject = f"🚀 暴富止盈: {token_mint[:6]}..."
                 msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出"
 
             asyncio.create_task(send_email_async(subject, msg))
-            if token_mint in self.portfolio:
-                del self.portfolio[token_mint]
 
     async def schedule_daily_report(self):
         """ 每日日报调度器 """

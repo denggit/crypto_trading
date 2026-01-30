@@ -2,16 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 @Author     : Zijun Deng
-@Date       : 1/30/26 1:20 PM
-@File       : notification.py
-@Description: 
+@Date       : 1/30/26 1:36 PM
+@File       : services/notification.py
+@Description: 邮件通知服务 (修复版)
 """
-import asyncio
-# services/notification.py
 import smtplib
-from email.header import Header
+import asyncio
 from email.mime.text import MIMEText
-
+from email.header import Header
+from email.utils import formataddr  # 🔥 新增
 from config.settings import EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER, SMTP_SERVER, SMTP_PORT
 from utils.logger import logger
 
@@ -22,8 +21,12 @@ def send_email_sync(subject, content):
 
     try:
         message = MIMEText(content, 'plain', 'utf-8')
-        message['From'] = Header("Solana Bot", 'utf-8')
-        message['To'] = Header("Master", 'utf-8')
+
+        # 🔥 修复核心：生成标准的 "昵称 <邮箱>" 格式
+        # 这样 QQ 邮箱就不会报错 550 了
+        message['From'] = formataddr(("Solana Bot", EMAIL_SENDER))
+        message['To'] = formataddr(("Master", EMAIL_RECEIVER))
+
         message['Subject'] = Header(subject, 'utf-8')
 
         if "qq.com" in SMTP_SERVER:

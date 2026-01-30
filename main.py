@@ -11,8 +11,8 @@ import asyncio
 from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_LIQUIDITY_USD, MIN_FDV, MAX_FDV
 from core.portfolio import PortfolioManager
 from services.risk_control import check_token_liquidity
-from services.solana_monitor import start_monitor, parse_tx, fetch_transaction_details
-from services.solana_trader import SolanaTrader
+from services.solana.monitor import start_monitor, parse_tx, fetch_transaction_details
+from services.solana.trader import SolanaTrader
 from utils.logger import logger
 
 

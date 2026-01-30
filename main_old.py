@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # 显式加载，确保 os.getenv 能读到数据
 
-# 🔥🔥【新增】强制让所有网络请求都走 Clash 代理 (包括 solana_trader.py 和 solana SDK)
+# 🔥🔥【新增】强制让所有网络请求都走 Clash 代理 (包括 trader.py 和 solana SDK)
 os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
 os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
 
@@ -33,7 +33,7 @@ from email.mime.text import MIMEText
 import aiohttp
 import websockets
 
-from services.solana_trader import SolanaTrader
+from services.solana.trader import SolanaTrader
 
 # ================= 配置区域 =================
 API_KEY = os.getenv("API_KEY")
