@@ -243,63 +243,68 @@ class PortfolioManager:
             await self.send_daily_summary()
             await asyncio.sleep(60)
 
-    async def send_daily_summary(self):
-        """ 生成并发送日报 """
-        logger.info("📊 正在生成每日日报...")
-        # trust_env=True 走代理
-        async with aiohttp.ClientSession(trust_env=True) as session:
-            try:
-                # 1. 获取 SOL 价格 (USDC)
-                usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-                quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
-                sol_price = float(quote['outAmount']) / 10 ** 6 if quote else 0
+        # ... (前面的代码保持不变) ...
 
-                # 2. 查询钱包 SOL 余额
-                balance_resp = await self.trader.rpc_client.get_balance(self.trader.payer.pubkey())
-                sol_balance = balance_resp.value / 10 ** 9
+        async def send_daily_summary(self):
+            """ 生成并发送日报 (带附件) """
+            logger.info("📊 正在生成每日日报...")
+            # trust_env=True 走代理
+            async with aiohttp.ClientSession(trust_env=True) as session:
+                try:
+                    # 1. 获取 SOL 价格 (USDC)
+                    usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                    quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
+                    sol_price = float(quote['outAmount']) / 10 ** 6 if quote else 0
 
-                # 3. 计算持仓总价值 (SOL)
-                holdings_val_sol = 0
-                holdings_details = ""
+                    # 2. 查询钱包 SOL 余额
+                    balance_resp = await self.trader.rpc_client.get_balance(self.trader.payer.pubkey())
+                    sol_balance = balance_resp.value / 10 ** 9
 
-                if self.portfolio:
-                    for mint, data in self.portfolio.items():
-                        qty = data['my_balance']
-                        if qty > 0:
-                            q = await self.trader.get_quote(session, mint, self.trader.SOL_MINT, qty)
-                            val = int(q['outAmount']) / 10 ** 9 if q else 0
-                            holdings_val_sol += val
-                            holdings_details += f"- {mint[:6]}...: 持有 {qty}, 价值 {val:.2f} SOL\n"
+                    # 3. 计算持仓总价值 (SOL)
+                    holdings_val_sol = 0
+                    holdings_details = ""
 
-                total_asset_sol = sol_balance + holdings_val_sol
-                total_asset_usd = total_asset_sol * sol_price
+                    if self.portfolio:
+                        for mint, data in self.portfolio.items():
+                            qty = data['my_balance']
+                            if qty > 0:
+                                q = await self.trader.get_quote(session, mint, self.trader.SOL_MINT, qty)
+                                val = int(q['outAmount']) / 10 ** 9 if q else 0
+                                holdings_val_sol += val
+                                holdings_details += f"- {mint[:6]}...: 持有 {qty}, 价值 {val:.2f} SOL\n"
 
-                # 4. 统计
-                buy_count = sum(1 for x in self.trade_history if x['action'] == 'BUY')
-                sell_count = sum(1 for x in self.trade_history if 'SELL' in x['action'])
+                    total_asset_sol = sol_balance + holdings_val_sol
+                    total_asset_usd = total_asset_sol * sol_price
 
-                report = f"""
-【📅 每日交易与资产报告】
-时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                    # 4. 统计
+                    buy_count = sum(1 for x in self.trade_history if x['action'] == 'BUY')
+                    sell_count = sum(1 for x in self.trade_history if 'SELL' in x['action'])
 
-💰 资产概览:
--------------------
-• SOL 价格: ${sol_price:.2f}
-• 钱包余额: {sol_balance:.4f} SOL
-• 持仓价值: {holdings_val_sol:.4f} SOL
-• 总计资产: {total_asset_sol:.4f} SOL (≈ ${total_asset_usd:.2f})
+                    report = f"""
+    【📅 每日交易与资产报告】
+    时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-📊 交易统计 (累计):
--------------------
-• 买入次数: {buy_count}
-• 卖出次数: {sell_count}
+    💰 资产概览:
+    -------------------
+    • SOL 价格: ${sol_price:.2f}
+    • 钱包余额: {sol_balance:.4f} SOL
+    • 持仓价值: {holdings_val_sol:.4f} SOL
+    • 总计资产: {total_asset_sol:.4f} SOL (≈ ${total_asset_usd:.2f})
 
-👜 当前持仓明细:
-{holdings_details if holdings_details else "(空仓)"}
+    📊 交易统计 (累计):
+    -------------------
+    • 买入次数: {buy_count}
+    • 卖出次数: {sell_count}
 
-🤖 机器人状态: 正常运行中
-"""
-                await send_email_async("📊 [日报] 资产与交易总结", report)
+    👜 当前持仓明细:
+    {holdings_details if holdings_details else "(空仓)"}
 
-            except Exception as e:
-                logger.error(f"生成日报失败: {e}")
+    🤖 机器人状态: 正常运行中
+    """
+                    # 🔥 修改点：发送邮件时带上 PORTFOLIO_FILE 附件
+                    # PORTFOLIO_FILE 已经在文件开头定义了
+                    await send_email_async("📊 [日报] 资产与交易总结", report, attachment_path=PORTFOLIO_FILE)
+                    logger.info("✅ 日报已发送 (包含 portfolio.json 附件)")
+
+                except Exception as e:
+                    logger.error(f"生成日报失败: {e}")

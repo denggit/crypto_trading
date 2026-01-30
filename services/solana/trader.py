@@ -2,13 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 @File       : services/solana/trader.py
-@Description: SOL 交易执行模块 (最终修复版：强制代理 + User-Agent + SSL忽略)
+@Description: SOL 交易执行模块 (最终修复版：Solana RPC 强制关闭 SSL 验证)
 """
 import base64
 import os
+import asyncio
+import socket
 import aiohttp
+import httpx  # 🔥 新增依赖
 from dotenv import load_dotenv
+
+# 引入 Solana 底层 Provider 以便注入自定义 Client
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.providers.async_http import AsyncHTTPProvider
 from solana.rpc.types import TxOpts, TokenAccountOpts
 from solders.keypair import Keypair
 from solders.message import to_bytes_versioned
@@ -24,22 +30,53 @@ load_dotenv()
 
 class SolanaTrader:
     def __init__(self, rpc_endpoint):
-        # 增加超时设置，防止网络卡死
+        # 🔥 核心修复：创建一个不验证 SSL 的 httpx 客户端
+        # trust_env=True 会自动读取系统环境变量里的代理设置
+        self.http_client = httpx.AsyncClient(verify=False, trust_env=True, timeout=30.0)
+
+        # 将这个“不听话”的客户端注入到 Solana Provider 中
+        provider = AsyncHTTPProvider(endpoint=rpc_endpoint, extra_headers={"Content-Type": "application/json"})
+        # 强行覆盖 provider 内部的 session (这是 solana-py 的底层逻辑)
+        # 注意：solana-py 版本不同可能实现不同，但通常 provider.session 就是 httpx client
+        # 如果版本较新，可能需要通过构造函数传递，但目前的库通常不支持直接传 client
+        # 所以我们用这一招：让 Provider 使用我们自定义的 client
+        # (注：为了兼容性，更稳妥的方式是让 httpx 全局不验证，但那样太暴力。
+        # 这里我们利用 AsyncHTTPProvider 的机制，它初始化时会创建 session。
+        # 我们这里重新初始化一个 AsyncClient 并传入 provider)
+
+        # 更稳妥的注入方式：
+        # 直接使用 args 构造 AsyncClient，但 solana 库没暴露 verify 参数。
+        # 所以我们这里做一个 trick：
         self.rpc_client = AsyncClient(rpc_endpoint, timeout=30)
+        # 替换内部 provider 的 session
+        if hasattr(self.rpc_client._provider, 'session'):
+            # 关闭原有的，换成我们的
+            # (这里不做替换了，风险较大，我们改用环境变量控制 httpx)
+            pass
+
+        # 💡 重新思考：最稳妥的方法其实是直接控制 httpx 的全局行为或者在 main.py 里处理
+        # 但既然要在 trader 里封装，我们用下面这个最稳的写法：
+        # 自定义 Provider 类太复杂，我们直接用 httpx 的环境变量。
+        # 见下方 _hack_httpx_verify()
+        pass
 
         if not PRIVATE_KEY:
             raise ValueError("❌ 未找到私钥，请在 .env 或 config/settings.py 中配置 PRIVATE_KEY")
 
         self.payer = Keypair.from_base58_string(PRIVATE_KEY)
-
         self.JUP_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
         self.JUP_SWAP_API = "https://quote-api.jup.ag/v6/swap"
         self.SOL_MINT = "So11111111111111111111111111111111111111112"
 
         logger.info(f"💳 交易钱包已加载: {self.payer.pubkey()}")
 
+    async def close(self):
+        """ 关闭资源 """
+        await self.rpc_client.close()
+        await self.http_client.aclose()
+
     async def get_token_balance(self, wallet_pubkey_str, token_mint_str):
-        """ 查询指定钱包的代币余额 (返回 UI Amount) """
+        """ 查询指定钱包的代币余额 """
         try:
             if token_mint_str == self.SOL_MINT:
                 resp = await self.rpc_client.get_balance(Pubkey.from_string(wallet_pubkey_str))
@@ -49,21 +86,16 @@ class SolanaTrader:
             resp = await self.rpc_client.get_token_accounts_by_owner(
                 Pubkey.from_string(wallet_pubkey_str), opts
             )
-
-            if not resp.value:
-                return 0
+            if not resp.value: return 0
 
             account_pubkey = resp.value[0].pubkey
             balance_resp = await self.rpc_client.get_token_account_balance(account_pubkey)
-
             return balance_resp.value.ui_amount if balance_resp.value.ui_amount else 0
         except Exception:
             return 0
 
     def _get_proxy(self):
-        """ 获取代理地址，优先使用 HTTP_PROXY """
-        # 这里硬编码您的 Clash 地址作为最后兜底，确保万无一失
-        return os.environ.get("HTTP_PROXY") or "http://127.0.0.1:7890"
+        return os.environ.get("HTTP_PROXY")
 
     async def get_quote(self, session, input_mint, output_mint, amount, slippage_bps=50):
         params = {
@@ -74,16 +106,11 @@ class SolanaTrader:
             "onlyDirectRoutes": "false",
             "asLegacyTransaction": "false",
         }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json"
-        }
-
-        # 🔥 强制指定代理
+        headers = {"Accept": "application/json"}
         proxy_url = self._get_proxy()
 
         try:
-            # 🔥 核心：proxy=proxy_url 显式传递，ssl=False 忽略证书错误
+            # 强制使用传入的 session (必须是配置好 NoSSL 的)
             async with session.get(self.JUP_QUOTE_API, params=params, headers=headers, ssl=False,
                                    proxy=proxy_url) as response:
                 if response.status != 200:
@@ -101,16 +128,10 @@ class SolanaTrader:
             "wrapAndUnwrapSol": True,
             "computeUnitPriceMicroLamports": "auto"
         }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Content-Type": "application/json"
-        }
-
-        # 🔥 强制指定代理
+        headers = {"Content-Type": "application/json"}
         proxy_url = self._get_proxy()
 
         try:
-            # 🔥 核心：proxy=proxy_url
             async with session.post(self.JUP_SWAP_API, json=payload, headers=headers, ssl=False,
                                     proxy=proxy_url) as response:
                 if response.status != 200:
@@ -123,19 +144,21 @@ class SolanaTrader:
 
     async def execute_swap(self, input_mint, output_mint, amount_lamports, slippage_bps=100):
         """ 执行交易 """
-        # 注意：这里 trust_env=True 保留，但下面的 get/post 会用显式代理覆盖它
-        async with aiohttp.ClientSession(trust_env=True) as session:
-            # 1. 询价
+        # 🔥🔥 核武器：强制 IPv4 + NoSSL 连接器 🔥🔥
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            ssl=False,
+            force_close=True
+        )
+        # trust_env=False 防止干扰，完全手动控制
+        async with aiohttp.ClientSession(connector=connector, trust_env=False) as session:
             quote = await self.get_quote(session, input_mint, output_mint, amount_lamports, slippage_bps)
             if not quote: return False, 0
 
             out_amount_est = int(quote['outAmount'])
-
-            # 2. 构建交易
             swap_res = await self.get_swap_tx(session, quote)
             if not swap_res: return False, 0
 
-            # 3. 签名上链
             try:
                 tx_bytes = base64.b64decode(swap_res['swapTransaction'])
                 transaction = VersionedTransaction.from_bytes(tx_bytes)
@@ -154,3 +177,18 @@ class SolanaTrader:
             except Exception as e:
                 logger.error(f"❌ 交易执行异常: {e}")
                 return False, 0
+
+
+# 🔥 Monkey Patch: 强制修改 httpx 的默认行为，使其不验证 SSL
+# 这一步是为了解决 Solana RPC (httpx) 在代理下的报错问题
+def patch_httpx_verify():
+    original_init = httpx.AsyncClient.__init__
+
+    def new_init(self, *args, **kwargs):
+        kwargs['verify'] = False  # 强制关闭验证
+        original_init(self, *args, **kwargs)
+
+    httpx.AsyncClient.__init__ = new_init
+
+
+patch_httpx_verify()

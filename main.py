@@ -4,9 +4,11 @@
 @Author     : Zijun Deng
 @Date       : 1/30/26 1:20 PM
 @File       : main.py
-@Description: 智能跟单机器人 (入口)
+@Description: 智能跟单机器人 (支持 --proxy 参数)
 """
 import asyncio
+import argparse
+import os
 
 from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_LIQUIDITY_USD, MIN_FDV, MAX_FDV
 from core.portfolio import PortfolioManager
@@ -66,6 +68,21 @@ async def main():
 
 
 if __name__ == "__main__":
+    # 🔥 新增：参数解析逻辑
+    parser = argparse.ArgumentParser(description='Solana Copy Trading Bot')
+    parser.add_argument('--proxy', action='store_true', help='开启本地 Clash 代理 (http://127.0.0.1:7890)')
+    args = parser.parse_args()
+
+    if args.proxy:
+        # 如果带了 --proxy，强制设置环境变量
+        proxy_url = "http://127.0.0.1:7890"
+        os.environ["HTTP_PROXY"] = proxy_url
+        os.environ["HTTPS_PROXY"] = proxy_url
+        logger.info(f"🌍 本地模式: 已启用代理 {proxy_url}")
+    else:
+        # 如果没带，不设置任何代理，适合云端直连
+        logger.info("☁️ 云端模式: 直连无代理")
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

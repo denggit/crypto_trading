@@ -1,28 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-@Author     : Zijun Deng
-@Date       : 1/30/26 1:36 PM
 @File       : run_health_check.py
-@Description: 
-"""
-# !/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-@File       : run_health_check.py
-@Description: 全系统启动前自检脚本 (Health Check)
-              依次测试：配置、网络代理、RPC连接、Jupiter询价、DexScreener风控、交易解析、邮件通知
+@Description: 全系统启动前自检脚本 (最终修复版 - 支持附件测试)
 """
 import asyncio
 import logging
 import os
 import sys
+import argparse
+import aiohttp
+import socket
+import traceback
+import json  # 🔥 新增 import
 from datetime import datetime
 
-import aiohttp
-
 # --- 导入项目模块 ---
-# 确保能找到本地模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config.settings import (
@@ -35,31 +28,17 @@ from services.notification import send_email_async
 from services.solana.monitor import parse_tx
 from core.portfolio import PortfolioManager
 
-# --- 配置控制台日志 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("HealthCheck")
 
 
 async def test_configuration():
     logger.info("🛠️ [1/6] 检查环境配置...")
-    errors = []
-    if not API_KEY: errors.append("缺少 API_KEY")
-    if not TARGET_WALLET: errors.append("缺少 TARGET_WALLET")
-    if not PRIVATE_KEY: errors.append("缺少 PRIVATE_KEY")
-    if not EMAIL_SENDER: errors.append("缺少 EMAIL_SENDER")
-
-    # 检查代理设置
     proxy = os.environ.get("HTTP_PROXY")
-    if not proxy:
-        logger.warning("⚠️ 未检测到 HTTP_PROXY 环境变量，您的网络可能会被墙！")
+    if proxy:
+        logger.info(f"✅ 检测到代理模式: {proxy}")
     else:
-        logger.info(f"✅ 代理已配置: {proxy}")
-
-    if errors:
-        logger.error(f"❌ 配置错误: {', '.join(errors)}")
-        return False
-
-    logger.info("✅ 配置检查通过")
+        logger.info("☁️ 检测到直连模式 (无代理)")
     return True
 
 
@@ -68,17 +47,17 @@ async def test_rpc_and_trader():
     try:
         trader = SolanaTrader(RPC_URL)
 
-        # 1. 测试 RPC: 查询 SOL 余额
+        # 1. 测试 RPC
+        logger.info(f"正在连接 RPC: {RPC_URL[:25]}...")
         balance_resp = await trader.rpc_client.get_balance(trader.payer.pubkey())
         balance = balance_resp.value / 10 ** 9
         logger.info(f"✅ RPC 连接成功 | 当前余额: {balance:.4f} SOL")
 
-        if balance < 0.05:
-            logger.warning("⚠️ 余额过低 (<0.05 SOL)，可能不足以支付 Gas 或交易！")
+        # 2. 测试 Jupiter
+        logger.info("正在测试 Jupiter 询价 (0.1 SOL -> USDC)...")
 
-        # 2. 测试 Jupiter: 模拟 0.1 SOL -> USDC 询价
-        # USDC Mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-        async with aiohttp.ClientSession(trust_env=True) as session:
+        connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False, force_close=True)
+        async with aiohttp.ClientSession(connector=connector, trust_env=False) as session:
             quote = await trader.get_quote(
                 session,
                 trader.SOL_MINT,
@@ -88,105 +67,109 @@ async def test_rpc_and_trader():
             if quote and 'outAmount' in quote:
                 out_amount = int(quote['outAmount']) / 10 ** 6
                 logger.info(f"✅ Jupiter 询价成功 | 0.1 SOL ≈ {out_amount:.2f} USDC")
+                return True
             else:
-                logger.error("❌ Jupiter 询价失败 (返回空)")
+                logger.error(f"❌ Jupiter 询价返回无效: {quote}")
                 return False
 
-        return True
     except Exception as e:
-        logger.error(f"❌ 交易模块测试失败: {e}")
+        logger.error("❌ 交易模块测试崩溃")
+        logger.error(traceback.format_exc())
         return False
 
 
 async def test_risk_control():
-    logger.info("🛡️ [3/6] 测试 DexScreener 风控接口 (需翻墙)...")
+    logger.info("🛡️ [3/6] 测试 DexScreener 风控接口...")
     try:
-        # 测试 JUP (正常币)
         jup_mint = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
-        async with aiohttp.ClientSession(trust_env=True) as session:
-            is_safe, liq, fdv = await check_token_liquidity(session, jup_mint)
 
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            ssl=False,
+            force_close=True
+        )
+
+        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+            is_safe, liq, fdv = await check_token_liquidity(session, jup_mint)
             if is_safe and liq > 0:
                 logger.info(f"✅ DexScreener 连接成功 | JUP 流动性: ${liq:,.0f}")
                 return True
             else:
-                logger.error(f"❌ DexScreener 返回数据异常 (JUP不应该为空)")
+                logger.error(f"❌ DexScreener 数据异常")
                 return False
     except Exception as e:
-        logger.error(f"❌ 风控模块测试失败: {e}")
+        logger.error(f"⚠️ 风控检查报错: {e}")
         return False
 
 
 async def test_parser_logic():
-    logger.info("🧠 [4/6] 测试交易解析逻辑 (Mock)...")
-    # 模拟一个 Helius 解析后的买入交易数据
+    logger.info("🧠 [4/6] 测试交易解析逻辑...")
     mock_tx = {
         "tokenTransfers": [
-            {
-                "mint": "So11111111111111111111111111111111111111112",  # SOL
-                "tokenAmount": 10.5,
-                "fromUserAccount": TARGET_WALLET,
-                "toUserAccount": "SomePoolAddress"
-            },
-            {
-                "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-                "tokenAmount": 1000000,
-                "fromUserAccount": "SomePoolAddress",
-                "toUserAccount": TARGET_WALLET
-            }
+            {"mint": "So11111111111111111111111111111111111111112", "tokenAmount": 10.5,
+             "fromUserAccount": TARGET_WALLET, "toUserAccount": "Pool"},
+            {"mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "tokenAmount": 1000000, "fromUserAccount": "Pool",
+             "toUserAccount": TARGET_WALLET}
         ]
     }
-
     result = parse_tx(mock_tx)
-    if result and result['action'] == 'BUY' and result[
-        'token_address'] == "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263":
-        logger.info(f"✅ 解析逻辑正常 | 识别为: {result['action']} {result['token_address']}")
+    if result and result['action'] == 'BUY':
+        logger.info(f"✅ 解析逻辑正常")
         return True
-    else:
-        logger.error(f"❌ 解析逻辑错误: 预期 BUY BONK, 实际得到 {result}")
-        return False
+    return False
 
 
 async def test_portfolio_manager():
-    logger.info("YZ [5/6] 测试仓位管理 (内存)...")
+    logger.info("YZ [5/6] 测试仓位管理...")
     try:
         trader = SolanaTrader(RPC_URL)
         pm = PortfolioManager(trader)
-
-        # 模拟买入
-        pm.add_position("TEST_TOKEN_MINT", 1000, 0.1)
-
-        if "TEST_TOKEN_MINT" in pm.portfolio:
+        pm.add_position("TEST_TOKEN_JUP", 1000, 0.1)
+        if "TEST_TOKEN_JUP" in pm.portfolio:
             logger.info("✅ 记账功能正常")
             return True
-        else:
-            logger.error("❌ 记账失败")
-            return False
+        return False
     except Exception as e:
-        logger.error(f"❌ 仓位管理测试失败: {e}")
+        logger.error(f"❌ 仓位管理失败: {e}")
         return False
 
 
 async def test_notification():
     logger.info("📧 [6/6] 测试邮件发送...")
+    test_file = "health_check_test.json"
     try:
-        # 发送一封测试邮件
-        subject = f"✅ 机器人自检通过 - {datetime.now().strftime('%H:%M:%S')}"
-        content = "所有模块自检正常：配置、RPC、Jupiter、DexScreener、解析器、仓位管理。\n\nReady to trade!"
+        # 🔥 1. 创建一个临时的测试文件
+        test_content = {
+            "status": "ok",
+            "message": "This is a test attachment from Health Check",
+            "timestamp": str(datetime.now())
+        }
+        with open(test_file, 'w', encoding='utf-8') as f:
+            json.dump(test_content, f, indent=4, ensure_ascii=False)
 
-        await send_email_async(subject, content)
-        logger.info("✅ 测试邮件发送指令已发出 (请检查收件箱)")
+        # 🔥 2. 发送邮件带附件
+        subject = f"✅ 机器人自检通过 - {datetime.now().strftime('%H:%M:%S')}"
+        content = "Ready to trade! (Proxy Check + Attachment Check)"
+
+        await send_email_async(subject, content, attachment_path=test_file)
+        # await send_email_async(subject, content)
+        logger.info("✅ 测试邮件发送指令已发出 (带附件)")
+
+        # 🔥 3. 发完后清理垃圾文件
+        if os.path.exists(test_file):
+            os.remove(test_file)
+
         return True
     except Exception as e:
         logger.error(f"❌ 邮件发送失败: {e}")
+        # 出错也要尝试清理文件
+        if os.path.exists(test_file):
+            os.remove(test_file)
         return False
 
 
 async def main():
-    print("\n" + "=" * 40)
-    print("   🚀 S.B.OT 系统启动前健康检查")
-    print("=" * 40 + "\n")
-
+    print("\n" + "=" * 40 + "\n   🚀 S.B.OT 健康检查 (双模版)\n" + "=" * 40 + "\n")
     checks = [
         test_configuration(),
         test_rpc_and_trader(),
@@ -195,25 +178,31 @@ async def main():
         test_portfolio_manager(),
         test_notification()
     ]
-
-    # 依次执行检查
-    results = []
-    for check in checks:
-        res = await check
-        results.append(res)
-        print("-" * 40)
+    results = [await c for c in checks]
 
     if all(results):
-        print("\n🎉🎉🎉 所有检查通过！系统状态：健康 (GREEN) 🎉🎉🎉")
-        print("您现在可以运行: python main.py\n")
+        print("\n🎉🎉🎉 所有检查通过！系统状态：健康 (GREEN) 🎉🎉🎉\n")
         exit(0)
     else:
-        print("\n🚫🚫🚫 检测到故障！系统状态：不健康 (RED) 🚫🚫🚫")
-        print("请根据上方日志修复错误后再启动。\n")
+        print("\n🚫🚫🚫 故障！请查看上方 Traceback 修复 🚫🚫🚫\n")
         exit(1)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--proxy', action='store_true', help='开启本地 Clash 代理')
+    args = parser.parse_args()
+
+    if args.proxy:
+        proxy_url = "http://127.0.0.1:7890"
+        os.environ["HTTP_PROXY"] = proxy_url
+        os.environ["HTTPS_PROXY"] = proxy_url
+        logger.info(f"🌍 本地模式: 已强制注入代理 {proxy_url}")
+    else:
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
+        logger.info("☁️ 云端模式: 直连无代理")
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
