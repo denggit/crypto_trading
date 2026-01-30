@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 @File       : run_health_check.py
-@Description: 全系统启动前自检脚本 (最终修复版 - 支持附件测试)
+@Description: 全系统启动前自检脚本 (最终修复版 - 零污染模式)
 """
 import asyncio
 import logging
@@ -12,7 +12,7 @@ import argparse
 import aiohttp
 import socket
 import traceback
-import json  # 🔥 新增 import
+import json
 from datetime import datetime
 
 # --- 导入项目模块 ---
@@ -26,6 +26,8 @@ from services.solana.trader import SolanaTrader
 from services.risk_control import check_token_liquidity
 from services.notification import send_email_async
 from services.solana.monitor import parse_tx
+# 🔥 关键修改：我们需要导入整个模块，以便修改里面的全局变量
+import core.portfolio
 from core.portfolio import PortfolioManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
@@ -120,25 +122,55 @@ async def test_parser_logic():
 
 
 async def test_portfolio_manager():
-    logger.info("YZ [5/6] 测试仓位管理...")
+    logger.info("YZ [5/6] 测试仓位管理 (零污染模式)...")
+
+    # 🔥 1. 备份：先记住原来的文件路径
+    original_portfolio_file = core.portfolio.PORTFOLIO_FILE
+    original_history_file = core.portfolio.HISTORY_FILE
+
+    # 🔥 2. 篡改：指向临时垃圾文件
+    temp_portfolio = "data/health_check_trash_portfolio.json"
+    temp_history = "data/health_check_trash_history.json"
+
+    core.portfolio.PORTFOLIO_FILE = temp_portfolio
+    core.portfolio.HISTORY_FILE = temp_history
+
     try:
         trader = SolanaTrader(RPC_URL)
         pm = PortfolioManager(trader)
+
+        # 这个操作现在只会写到垃圾文件里
         pm.add_position("TEST_TOKEN_JUP", 1000, 0.1)
+
         if "TEST_TOKEN_JUP" in pm.portfolio:
-            logger.info("✅ 记账功能正常")
-            return True
-        return False
+            logger.info("✅ 记账功能正常 (已写入临时文件)")
+            result = True
+        else:
+            result = False
+
     except Exception as e:
         logger.error(f"❌ 仓位管理失败: {e}")
-        return False
+        result = False
+
+    finally:
+        # 🔥 3. 还原：把路径改回去，防止影响后续逻辑
+        core.portfolio.PORTFOLIO_FILE = original_portfolio_file
+        core.portfolio.HISTORY_FILE = original_history_file
+
+        # 🔥 4. 扫地：删除生成的临时文件
+        if os.path.exists(temp_portfolio):
+            os.remove(temp_portfolio)
+        if os.path.exists(temp_history):
+            os.remove(temp_history)
+        logger.info("🧹 临时测试数据已清理")
+
+    return result
 
 
 async def test_notification():
     logger.info("📧 [6/6] 测试邮件发送...")
     test_file = "health_check_test.json"
     try:
-        # 🔥 1. 创建一个临时的测试文件
         test_content = {
             "status": "ok",
             "message": "This is a test attachment from Health Check",
@@ -147,22 +179,18 @@ async def test_notification():
         with open(test_file, 'w', encoding='utf-8') as f:
             json.dump(test_content, f, indent=4, ensure_ascii=False)
 
-        # 🔥 2. 发送邮件带附件
         subject = f"✅ 机器人自检通过 - {datetime.now().strftime('%H:%M:%S')}"
         content = "Ready to trade! (Proxy Check + Attachment Check)"
 
         await send_email_async(subject, content, attachment_path=test_file)
-        # await send_email_async(subject, content)
         logger.info("✅ 测试邮件发送指令已发出 (带附件)")
 
-        # 🔥 3. 发完后清理垃圾文件
         if os.path.exists(test_file):
             os.remove(test_file)
 
         return True
     except Exception as e:
         logger.error(f"❌ 邮件发送失败: {e}")
-        # 出错也要尝试清理文件
         if os.path.exists(test_file):
             os.remove(test_file)
         return False
