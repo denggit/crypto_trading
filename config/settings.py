@@ -45,3 +45,6 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 SMTP_SERVER = "smtp.qq.com"
 SMTP_PORT = 465
+
+# --- 添加 Jupiter API Key 配置 ---
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")

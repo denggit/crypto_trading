@@ -6,12 +6,11 @@
 """
 import base64
 import os
-import asyncio
 import socket
+
 import aiohttp
 import httpx  # 🔥 新增依赖
 from dotenv import load_dotenv
-
 # 引入 Solana 底层 Provider 以便注入自定义 Client
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.providers.async_http import AsyncHTTPProvider
@@ -21,7 +20,7 @@ from solders.message import to_bytes_versioned
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
-from config.settings import PRIVATE_KEY
+from config.settings import PRIVATE_KEY, JUPITER_API_KEY
 from utils.logger import logger
 
 # 加载环境变量
@@ -64,8 +63,8 @@ class SolanaTrader:
             raise ValueError("❌ 未找到私钥，请在 .env 或 config/settings.py 中配置 PRIVATE_KEY")
 
         self.payer = Keypair.from_base58_string(PRIVATE_KEY)
-        self.JUP_QUOTE_API = "https://lite-api.jup.ag/v6/quote"
-        self.JUP_SWAP_API = "https://lite-api.jup.ag/v6/swap"
+        self.JUP_QUOTE_API = "https://api.jup.ag/v6/quote"
+        self.JUP_SWAP_API = "https://api.jup.ag/v6/swap"
         self.SOL_MINT = "So11111111111111111111111111111111111111112"
 
         logger.info(f"💳 交易钱包已加载: {self.payer.pubkey()}")
@@ -106,15 +105,17 @@ class SolanaTrader:
             "onlyDirectRoutes": "false",
             "asLegacyTransaction": "false",
         }
-        headers = {"Accept": "application/json"}
-        proxy_url = self._get_proxy()
+        # 🔥 关键修改：添加 x-api-key 请求头
+        headers = {
+            "Accept": "application/json",
+            "x-api-key": JUPITER_API_KEY  # 身份凭证
+        }
 
         try:
-            # 强制使用传入的 session (必须是配置好 NoSSL 的)
-            async with session.get(self.JUP_QUOTE_API, params=params, headers=headers, ssl=False,
-                                   proxy=proxy_url) as response:
+            # 这里的 session 依然会复用之前的代理/NoSSL设置，非常完美
+            async with session.get(self.JUP_QUOTE_API, params=params, headers=headers) as response:
                 if response.status != 200:
-                    logger.error(f"询价失败: {await response.text()}")
+                    logger.error(f"询价失败 [{response.status}]: {await response.text()}")
                     return None
                 return await response.json()
         except Exception as e:
@@ -128,14 +129,16 @@ class SolanaTrader:
             "wrapAndUnwrapSol": True,
             "computeUnitPriceMicroLamports": "auto"
         }
-        headers = {"Content-Type": "application/json"}
-        proxy_url = self._get_proxy()
+        # 🔥 关键修改：同样添加 x-api-key
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": JUPITER_API_KEY
+        }
 
         try:
-            async with session.post(self.JUP_SWAP_API, json=payload, headers=headers, ssl=False,
-                                    proxy=proxy_url) as response:
+            async with session.post(self.JUP_SWAP_API, json=payload, headers=headers) as response:
                 if response.status != 200:
-                    logger.error(f"构建交易失败: {await response.text()}")
+                    logger.error(f"构建交易失败 [{response.status}]: {await response.text()}")
                     return None
                 return await response.json()
         except Exception as e:
