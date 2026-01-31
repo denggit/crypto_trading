@@ -7,11 +7,13 @@
 import smtplib
 import os
 import asyncio
+from email.mime.application import MIMEApplication
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from config.settings import EMAIL_SENDER, EMAIL_RECEIVER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT, BOT_NAME
+from utils.logger import logger
 
 
 async def send_email_async(subject, content, attachment_path=None):

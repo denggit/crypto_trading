@@ -7,13 +7,15 @@
 import asyncio
 import json
 import os
-import aiohttp
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+import aiohttp
 
 # 导入配置和工具
-from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI, REPORT_HOUR, REPORT_MINUTE
+from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI, REPORT_HOUR, REPORT_MINUTE, \
+    TAKE_PROFIT_SELL_PCT
 from services.notification import send_email_async
 from utils.logger import logger
 
@@ -29,10 +31,10 @@ class PortfolioManager:
         self.portfolio = {}  # 当前持仓
         self.trade_history = []  # 历史记录
         self.is_running = True
-        
+
         # 🔥 锁与缓存
         self.locks = defaultdict(asyncio.Lock)  # Token 级细粒度锁
-        self.buy_counts_cache = {}   # 买入次数缓存
+        self.buy_counts_cache = {}  # 买入次数缓存
         self.sell_counts_cache = {}  # 卖出次数缓存
 
         # 线程池
@@ -41,7 +43,7 @@ class PortfolioManager:
         # 初始化加载
         self._ensure_data_dir()
         self._load_data()
-        self._rebuild_counts_cache() # 重建买卖计数
+        self._rebuild_counts_cache()  # 重建买卖计数
 
     def _ensure_data_dir(self):
         if not os.path.exists(DATA_DIR):
@@ -66,20 +68,21 @@ class PortfolioManager:
     def _rebuild_counts_cache(self):
         """ 🚀 重建买入和卖出的计数缓存 """
         self.buy_counts_cache = {}
-        self.sell_counts_cache = {} # Reset
-        
+        self.sell_counts_cache = {}  # Reset
+
         for record in self.trade_history:
             token = record.get('token')
             if not token: continue
-            
+
             action = record.get('action', '')
-            
+
             if action == 'BUY':
                 self.buy_counts_cache[token] = self.buy_counts_cache.get(token, 0) + 1
             elif 'SELL' in action:
                 self.sell_counts_cache[token] = self.sell_counts_cache.get(token, 0) + 1
-                
-        logger.info(f"⚡️ 计数缓存已重建 | 历史买入代币数: {len(self.buy_counts_cache)} | 历史卖出代币数: {len(self.sell_counts_cache)}")
+
+        logger.info(
+            f"⚡️ 计数缓存已重建 | 历史买入代币数: {len(self.buy_counts_cache)} | 历史卖出代币数: {len(self.sell_counts_cache)}")
 
     def get_token_lock(self, token_mint):
         return self.locks[token_mint]
@@ -90,7 +93,7 @@ class PortfolioManager:
         )
 
     def _save_history(self):
-        history_snapshot = list(self.trade_history) 
+        history_snapshot = list(self.trade_history)
         asyncio.get_event_loop().run_in_executor(
             self.calc_executor, self._write_json_worker, HISTORY_FILE, history_snapshot
         )
@@ -122,21 +125,22 @@ class PortfolioManager:
 
         self.portfolio[token_mint]['my_balance'] += amount_bought
         self.portfolio[token_mint]['cost_sol'] += cost_sol
-        
+
         # 更新缓存
         self.buy_counts_cache[token_mint] = self.buy_counts_cache.get(token_mint, 0) + 1
-        
+
         self._save_portfolio()
         self._record_history("BUY", token_mint, amount_bought, cost_sol)
-        logger.info(f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']} | 第 {self.buy_counts_cache[token_mint]} 次买入")
+        logger.info(
+            f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']} | 第 {self.buy_counts_cache[token_mint]} 次买入")
 
     def get_buy_counts(self, token_mint):
         return self.buy_counts_cache.get(token_mint, 0)
-        
+
     def get_sell_counts(self, token_mint):
         return self.sell_counts_cache.get(token_mint, 0)
 
-    async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):        
+    async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
         # 1. 检查持仓
         if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
             return
@@ -154,33 +158,34 @@ class PortfolioManager:
         sell_ratio = 1.0
         if total_before_sell > 0:
             sell_ratio = smart_money_sold_amt / total_before_sell
-            
+
             # 🔥 策略 A：90% 阈值清仓 (直接修改 is_force_clear)
-            if sell_ratio > 0.90: 
+            if sell_ratio > 0.90:
                 is_force_clear = True
                 sell_ratio = 1.0
                 reason_msg = f"(卖出比例 {sell_ratio:.1%} > 90% -> 触发清仓)"
 
         # 3. 策略 B：回合制 + 试盘过滤
         total_buys = self.get_buy_counts(token_mint)
-        current_sell_seq = self.get_sell_counts(token_mint) + 1 
-        
-        is_tiny_sell = sell_ratio < 0.05 
-        
+        current_sell_seq = self.get_sell_counts(token_mint) + 1
+
+        is_tiny_sell = sell_ratio < 0.05
+
         # 只有当还没有触发清仓时，才去检查回合制逻辑
         if not is_force_clear:
             # 逻辑 B1: 正常清仓 (次数到了，且不是试盘)
             if current_sell_seq >= total_buys and not is_tiny_sell and total_buys > 0:
-                logger.warning(f"🚨 [策略触发] 第 {current_sell_seq}/{total_buys} 次卖出 (比例{sell_ratio:.1%}) -> 触发尾单清仓！")
+                logger.warning(
+                    f"🚨 [策略触发] 第 {current_sell_seq}/{total_buys} 次卖出 (比例{sell_ratio:.1%}) -> 触发尾单清仓！")
                 is_force_clear = True
                 reason_msg = f"(第 {current_sell_seq}/{total_buys} 次 - 尾单清仓)"
-                
+
             # 逻辑 B2: 兜底清仓
             elif current_sell_seq >= total_buys + 2 and total_buys > 0:
                 logger.warning(f"🚨 [策略触发] 卖出次数过多 ({current_sell_seq} > {total_buys}+2) -> 触发强制止损清仓！")
                 is_force_clear = True
                 reason_msg = f"(第 {current_sell_seq} 次 - 超限清仓)"
-                
+
             # 逻辑 B3: 试盘豁免
             elif current_sell_seq >= total_buys and is_tiny_sell:
                 logger.info(f"🛡️ [策略豁免] 虽次数已满，但大哥仅卖出 {sell_ratio:.1%} (试盘) -> 仅跟随，不清仓")
@@ -193,7 +198,7 @@ class PortfolioManager:
         if is_force_clear:
             # 强制清仓模式 (整数操作，无浮点误差)
             amount_to_sell = my_holdings
-            sell_ratio = 1.0 
+            sell_ratio = 1.0
         else:
             # 正常比例跟单模式 (含试盘跟随)
             amount_to_sell = int(my_holdings * sell_ratio)
@@ -205,12 +210,13 @@ class PortfolioManager:
             quote = await self.trader.get_quote(
                 session, token_mint, self.trader.SOL_MINT, amount_to_sell
             )
-            
+
             if quote:
-                est_val_sol = int(quote['outAmount']) / 10**9
+                est_val_sol = int(quote['outAmount']) / 10 ** 9
                 # 设定门槛：0.01 SOL (约 $1.5 - $2)
                 if est_val_sol < 0.01:
-                    logger.warning(f"📉 [卖出忽略] 比例虽为 {sell_ratio:.1%}，但预计价值仅 {est_val_sol:.4f} SOL (< 0.01) -> 跳过以节省Gas")
+                    logger.warning(
+                        f"📉 [卖出忽略] 比例虽为 {sell_ratio:.1%}，但预计价值仅 {est_val_sol:.4f} SOL (< 0.01) -> 跳过以节省Gas")
                     return
             else:
                 logger.warning(f"⚠️ [卖出跳过] 无法获取 {token_mint} 报价，暂停跟随")
@@ -227,7 +233,7 @@ class PortfolioManager:
 
         if success:
             self.portfolio[token_mint]['my_balance'] -= amount_to_sell
-            
+
             # 更新卖出计数缓存
             self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
 
@@ -235,7 +241,7 @@ class PortfolioManager:
                 del self.portfolio[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
                 logger.info(f"🧹 正在尝试回收账户租金...")
-                await asyncio.sleep(2) 
+                await asyncio.sleep(2)
                 asyncio.create_task(self.trader.close_token_account(token_mint))
 
             self._save_portfolio()
@@ -257,7 +263,7 @@ class PortfolioManager:
                     try:
                         my_data = self.portfolio[token_mint]
                         if my_data['my_balance'] <= 0: continue
-                        
+
                         sm_amount_raw = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
                         should_sell = False
                         reason = ""
@@ -266,9 +272,10 @@ class PortfolioManager:
                             should_sell = True
                             reason = "大佬余额为 0"
                         else:
-                            quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT, sm_amount_raw)
+                            quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
+                                                                sm_amount_raw)
                             if quote:
-                                val_in_sol = int(quote['outAmount']) / 10**9
+                                val_in_sol = int(quote['outAmount']) / 10 ** 9
                                 if val_in_sol < 0.05:
                                     should_sell = True
                                     reason = f"大佬余额价值仅 {val_in_sol:.4f} SOL (判定为粉尘)"
@@ -280,7 +287,7 @@ class PortfolioManager:
 
                     except Exception as e:
                         logger.error(f"同步检查异常: {e}")
-                
+
                 await asyncio.sleep(20)
 
     async def monitor_1000x_profit(self):
@@ -290,48 +297,51 @@ class PortfolioManager:
                 if not self.portfolio:
                     await asyncio.sleep(5)
                     continue
-                
+
                 # 复制一份 key 列表防止遍历时修改字典报错
                 for token_mint in list(self.portfolio.keys()):
                     try:
                         data = self.portfolio[token_mint]
                         if data['my_balance'] <= 0: continue
-                        
+
                         # 询价
-                        quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT, data['my_balance'])
-                        
+                        quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
+                                                            data['my_balance'])
+
                         if quote:
                             curr_val = int(quote['outAmount'])
                             cost = data['cost_sol']
                             # 计算收益率
                             roi = (curr_val / cost) - 1 if cost > 0 else 0
-                            
+
                             # 🔥 触发止盈阈值 (比如 1000%)
                             if roi >= TAKE_PROFIT_ROI:
-                                logger.warning(f"🚀 [暴富时刻] {token_mint} 收益率达到 {roi*100:.0f}%！执行“留种”止盈策略...")
-                                
-                                # --- 核心修改：只卖 50%，留 50% ---
-                                amount_to_sell = int(data['my_balance'] * 0.50) 
-                                
+                                logger.warning(
+                                    f"🚀 [暴富时刻] {token_mint} 收益率达到 {roi * 100:.0f}%！执行“留种”止盈策略...")
+
+                                # --- 核心修改：只卖 TAKE_PROFIT_SELL_PCT%，留剩余的和大哥共进退 ---
+                                amount_to_sell = int(data['my_balance'] * TAKE_PROFIT_SELL_PCT)
+
                                 # 如果剩下的太少(是粉尘)，干脆全卖了
-                                est_val_remaining = (curr_val * 0.2) / 10**9
+                                est_val_remaining = (curr_val * 0.2) / 10 ** 9
                                 is_clear_all = False
-                                
-                                if est_val_remaining < 0.01: # 剩下的不值钱，全清
+
+                                if est_val_remaining < 0.01:  # 剩下的不值钱，全清
                                     amount_to_sell = data['my_balance']
                                     is_clear_all = True
                                     logger.info("   -> 剩余价值过低，执行全仓止盈")
                                 else:
-                                    logger.info("   -> 锁定 80% 利润，保留 20% 博百倍金狗！")
+                                    logger.info(
+                                        f"   -> 锁定 {TAKE_PROFIT_SELL_PCT * 100}% 利润，保留 {(1 - TAKE_PROFIT_SELL_PCT) * 100}% 博百倍金狗！")
 
                                 # 执行卖出
                                 success, est_sol_out = await self.trader.execute_swap(
                                     token_mint, self.trader.SOL_MINT, amount_to_sell, SLIPPAGE_SELL
                                 )
-                                
+
                                 if success:
                                     self.portfolio[token_mint]['my_balance'] -= amount_to_sell
-                                    
+
                                     # 如果是全清，才删除数据和关账户
                                     if is_clear_all or self.portfolio[token_mint]['my_balance'] <= 0:
                                         if token_mint in self.portfolio:
@@ -341,21 +351,21 @@ class PortfolioManager:
                                         # 如果是留种，仅仅把成本归零（因为已经回本了），让它变成“零成本持仓”
                                         # 这样下次就不会再基于旧成本计算 ROI 了，或者你可以选择不更新成本，继续监控
                                         # 这里简单处理：更新余额即可，下次循环如果 ROI 还在涨，还会继续卖 80% 的 80%...
-                                        pass 
+                                        pass
 
                                     self._save_portfolio()
                                     self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out)
-                                    
+
                                     # 发邮件
-                                    msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi*100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out/10**9:.4f}"
+                                    msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi * 100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out / 10 ** 9:.4f}"
                                     asyncio.create_task(send_email_async(f"💰 止盈通知: {token_mint[:6]}...", msg))
-                                    
+
                                     # 稍微休息一下，防止针对同一个币疯狂触发
                                     await asyncio.sleep(60)
 
                     except Exception as e:
                         logger.error(f"盯盘异常: {e}")
-                
+
                 await asyncio.sleep(10)
 
     async def force_sell_all(self, token_mint, amount, roi):
@@ -365,7 +375,7 @@ class PortfolioManager:
         if success:
             if token_mint in self.portfolio:
                 del self.portfolio[token_mint]
-                
+
             # 更新卖出计数 (防止逻辑混乱，强平也算一次卖出)
             self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
 
@@ -386,10 +396,10 @@ class PortfolioManager:
         """ 每日日报调度器 (支持自定义时间) """
         # 🔥 2. 日志里打印出设定好的时间，方便检查
         logger.info(f"📅 日报调度器已启动 (每天 {REPORT_HOUR:02d}:{REPORT_MINUTE:02d} 发送)...")
-        
+
         while self.is_running:
             now = datetime.now()
-            
+
             # 🔥 3. 使用配置的时间变量
             target_time = now.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
 
@@ -402,7 +412,7 @@ class PortfolioManager:
 
             await asyncio.sleep(sleep_seconds)
             await self.send_daily_summary()
-            
+
             # 发送完休息 60 秒，防止一分钟内重复触发
             await asyncio.sleep(60)
 
@@ -416,7 +426,7 @@ class PortfolioManager:
         daily_losses = 0
         total_wins = 0
         total_losses = 0
-        COST_THRESHOLD_FOR_WINRATE = 0.01 
+        COST_THRESHOLD_FOR_WINRATE = 0.01
 
         for record in history_snapshot:
             token = record['token']
@@ -426,7 +436,7 @@ class PortfolioManager:
             try:
                 rec_time = datetime.strptime(record['time'], "%Y-%m-%d %H:%M:%S")
             except:
-                continue 
+                continue
 
             if action == 'BUY':
                 temp_holdings[token] = temp_holdings.get(token, 0) + amount
@@ -491,9 +501,9 @@ class PortfolioManager:
                 history_snapshot = list(self.trade_history)
                 loop = asyncio.get_event_loop()
                 stats = await loop.run_in_executor(
-                    self.calc_executor, 
-                    self._calculate_stats_worker, 
-                    history_snapshot, 
+                    self.calc_executor,
+                    self._calculate_stats_worker,
+                    history_snapshot,
                     yesterday
                 )
 
