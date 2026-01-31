@@ -33,6 +33,7 @@ TAKE_PROFIT_ROI = 10.0
 MIN_LIQUIDITY_USD = 3000   # 原来是 20000 -> 改为 3000
 MAX_FDV = 5000000          # 保持不变
 MIN_FDV = 0                # 原来是 200000 -> 改为 0 (只要有池子就跟)
+MIN_SMART_MONEY_COST = 1.0 # 设定门槛：少于 1.0 SOL 视为试盘/杂音，不跟
 
 # --- 邮箱配置 ---
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
