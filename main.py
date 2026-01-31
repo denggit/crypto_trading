@@ -28,8 +28,14 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
     if trade['action'] == "BUY":
         # 1. 风控
         is_safe, liq, fdv = await check_token_liquidity(session, token)
+        is_honeypot = await check_is_honeypot(session, mint)
         if not is_safe:
             logger.warning(f"⚠️ 无法获取数据: {token}")
+            return
+
+        if not is_honeypot:
+            # 为FALSE的话说明不安全
+            logger.warning(f"⚠️ 该代币不安全: {token}")
             return
 
         logger.info(f"🔍 体检: 池子 ${liq:,.0f} | 市值 ${fdv:,.0f}")
