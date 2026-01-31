@@ -290,20 +290,72 @@ class PortfolioManager:
                 if not self.portfolio:
                     await asyncio.sleep(5)
                     continue
+                
+                # 复制一份 key 列表防止遍历时修改字典报错
                 for token_mint in list(self.portfolio.keys()):
                     try:
                         data = self.portfolio[token_mint]
                         if data['my_balance'] <= 0: continue
+                        
+                        # 询价
                         quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT, data['my_balance'])
+                        
                         if quote:
                             curr_val = int(quote['outAmount'])
                             cost = data['cost_sol']
+                            # 计算收益率
                             roi = (curr_val / cost) - 1 if cost > 0 else 0
+                            
+                            # 🔥 触发止盈阈值 (比如 1000%)
                             if roi >= TAKE_PROFIT_ROI:
-                                logger.warning(f"🚀 触发 {roi * 100:.0f}% 止盈！{token_mint} 强平！")
-                                await self.force_sell_all(token_mint, data['my_balance'], roi)
+                                logger.warning(f"🚀 [暴富时刻] {token_mint} 收益率达到 {roi*100:.0f}%！执行“留种”止盈策略...")
+                                
+                                # --- 核心修改：只卖 50%，留 50% ---
+                                amount_to_sell = int(data['my_balance'] * 0.50) 
+                                
+                                # 如果剩下的太少(是粉尘)，干脆全卖了
+                                est_val_remaining = (curr_val * 0.2) / 10**9
+                                is_clear_all = False
+                                
+                                if est_val_remaining < 0.01: # 剩下的不值钱，全清
+                                    amount_to_sell = data['my_balance']
+                                    is_clear_all = True
+                                    logger.info("   -> 剩余价值过低，执行全仓止盈")
+                                else:
+                                    logger.info("   -> 锁定 80% 利润，保留 20% 博百倍金狗！")
+
+                                # 执行卖出
+                                success, est_sol_out = await self.trader.execute_swap(
+                                    token_mint, self.trader.SOL_MINT, amount_to_sell, SLIPPAGE_SELL
+                                )
+                                
+                                if success:
+                                    self.portfolio[token_mint]['my_balance'] -= amount_to_sell
+                                    
+                                    # 如果是全清，才删除数据和关账户
+                                    if is_clear_all or self.portfolio[token_mint]['my_balance'] <= 0:
+                                        if token_mint in self.portfolio:
+                                            del self.portfolio[token_mint]
+                                        asyncio.create_task(self.trader.close_token_account(token_mint))
+                                    else:
+                                        # 如果是留种，仅仅把成本归零（因为已经回本了），让它变成“零成本持仓”
+                                        # 这样下次就不会再基于旧成本计算 ROI 了，或者你可以选择不更新成本，继续监控
+                                        # 这里简单处理：更新余额即可，下次循环如果 ROI 还在涨，还会继续卖 80% 的 80%...
+                                        pass 
+
+                                    self._save_portfolio()
+                                    self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out)
+                                    
+                                    # 发邮件
+                                    msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi*100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out/10**9:.4f}"
+                                    asyncio.create_task(send_email_async(f"💰 止盈通知: {token_mint[:6]}...", msg))
+                                    
+                                    # 稍微休息一下，防止针对同一个币疯狂触发
+                                    await asyncio.sleep(60)
+
                     except Exception as e:
                         logger.error(f"盯盘异常: {e}")
+                
                 await asyncio.sleep(10)
 
     async def force_sell_all(self, token_mint, amount, roi):
