@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 @File       : analyze_wallet.py
-@Description: 智能钱包画像识别 (Pro 版 - 支持突破100分与风控惩罚)
+@Description: 智能钱包画像识别 V4 (代币全量成本法 + 实时行情修正)
 """
 import asyncio
 import os
@@ -11,277 +11,240 @@ import argparse
 from collections import defaultdict
 import statistics
 import aiohttp
+from datetime import datetime
 
-# 导入配置中的 API Key
+# 导入配置
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import HELIUS_API_KEY
 
 # === ⚙️ 基础配置 ===
 TARGET_TX_COUNT = 20000
-MIN_SOL_THRESHOLD = 0.1
+WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 
-# =================
-
-async def fetch_history_pagination(session, address, max_count=2000):
-    """ 自动翻页拉取交易记录 (带 429 自动重试机制) """
+async def fetch_history_pagination(session, address, max_count=3000):
+    """ 带自动重试的翻页抓取 """
     all_txs = []
     last_signature = None
     retry_count = 0
-    max_retries = 5  # 最多重试 5 次
-
-    print(f"🔍 正在深度审计: {address[:6]}...")
-
     while len(all_txs) < max_count:
-        batch_limit = 100
         url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
-        params = {"api-key": HELIUS_API_KEY, "type": "SWAP", "limit": str(batch_limit)}
+        params = {"api-key": HELIUS_API_KEY, "type": "SWAP", "limit": 100}
         if last_signature: params["before"] = last_signature
-
         try:
             async with session.get(url, params=params) as resp:
                 if resp.status == 429:
-                    # 🔥 核心：遇到 429 聪明地躲避
                     retry_count += 1
-                    if retry_count > max_retries:
-                        print(f"🛑 [429] 达到最大重试次数，放弃该钱包")
-                        break
-
-                    wait_time = retry_count * 2  # 第一次等2秒，第二次4秒，以此类推
-                    print(f"⚠️  [429] 触发频率限制，正在等待 {wait_time} 秒后重试 ({retry_count}/{max_retries})...")
-                    await asyncio.sleep(wait_time)
-                    continue  # 继续下一次循环，重试当前请求
-
-                if resp.status != 200:
-                    print(f"❌ API 错误: {resp.status}")
-                    break
-
-                # 请求成功，重置重试计数
-                retry_count = 0
+                    await asyncio.sleep(retry_count * 2)
+                    continue
+                if resp.status != 200: break
                 data = await resp.json()
                 if not data: break
-
                 all_txs.extend(data)
                 last_signature = data[-1].get('signature')
-
-                if len(data) < batch_limit: break
-                # 适当增加页间延迟，保护 API
-                await asyncio.sleep(0.2)
-
-        except Exception as e:
-            print(f"❌ 网络异常: {e}")
+                if len(data) < 100: break
+                await asyncio.sleep(0.1)
+        except:
             break
-
     return all_txs[:max_count]
 
 
-def parse_trades(transactions, target_wallet):
-    """ 解析交易流 """
-    positions = defaultdict(list)
-    closed_trades = []
-    IGNORE_MINTS = ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
+async def get_current_prices(session, token_mints):
+    """ 批量获取代币当前价格 (DexScreener) """
+    if not token_mints: return {}
+    prices = {}
+    # 分批请求，防止 URL 过长
+    mints_list = list(token_mints)
+    for i in range(0, len(mints_list), 30):
+        chunk = mints_list[i:i + 30]
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
+        try:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get('pairs', [])
+                    for p in pairs:
+                        if p.get('chainId') == 'solana':
+                            prices[p['baseToken']['address']] = float(p.get('priceUsd', 0))
+        except:
+            continue
+    return prices
+
+
+async def get_sol_price(session):
+    """ 获取当前 SOL 价格用于换算 """
+    try:
+        async with session.get(
+                "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112") as resp:
+            data = await resp.json()
+            return float(data['pairs'][0]['priceUsd'])
+    except:
+        return 150.0
+
+
+async def parse_token_projects(session, transactions, target_wallet):
+    """
+    V4 核心算法：以代币为单位的“全量统计法”
+    计算逻辑：(已卖SOL + 剩余价值) / 总投入成本 - 1
+    """
+    projects = defaultdict(lambda: {
+        "buy_sol": 0.0,
+        "sell_sol": 0.0,
+        "buy_tokens": 0.0,
+        "sell_tokens": 0.0,
+        "first_time": 0,
+        "last_time": 0
+    })
 
     for tx in reversed(transactions):
-        if 'tokenTransfers' not in tx: continue
         timestamp = tx.get('timestamp', 0)
-        sol_change, token_change, token_mint = 0, 0, ""
+        sol_in_tx = 0
+        token_changes = defaultdict(float)
 
+        # 统计 SOL 变动 (原生 + WSOL)
         for nt in tx.get('nativeTransfers', []):
-            if nt['fromUserAccount'] == target_wallet: sol_change -= nt['amount'] / 1e9
-            if nt['toUserAccount'] == target_wallet: sol_change += nt['amount'] / 1e9
+            if nt['fromUserAccount'] == target_wallet: sol_in_tx -= nt['amount'] / 1e9
+            if nt['toUserAccount'] == target_wallet: sol_in_tx += nt['amount'] / 1e9
 
         for tt in tx.get('tokenTransfers', []):
-            if tt['mint'] in IGNORE_MINTS: continue
-            token_mint = tt['mint']
+            mint = tt['mint']
             amt = tt['tokenAmount']
-            if tt['fromUserAccount'] == target_wallet: token_change -= amt
-            if tt['toUserAccount'] == target_wallet: token_change += amt
+            if mint == WSOL_MINT:
+                if tt['fromUserAccount'] == target_wallet: sol_in_tx -= amt
+                if tt['toUserAccount'] == target_wallet: sol_in_tx += amt
+            else:
+                if tt['fromUserAccount'] == target_wallet: token_changes[mint] -= amt
+                if tt['toUserAccount'] == target_wallet: token_changes[mint] += amt
 
-        if not token_mint or token_change == 0: continue
-        if abs(sol_change) < 0.01 and sol_change != 0: continue
+        # 将变动归档到代币项目
+        for mint, delta in token_changes.items():
+            if projects[mint]["first_time"] == 0: projects[mint]["first_time"] = timestamp
+            projects[mint]["last_time"] = timestamp
 
-        if token_change > 0 and sol_change < 0:  # BUY
-            positions[token_mint].append({"time": timestamp, "cost_sol": abs(sol_change)})
+            if delta > 0:  # 买入
+                projects[mint]["buy_tokens"] += delta
+                projects[mint]["buy_sol"] += abs(sol_in_tx)
+            elif delta < 0:  # 卖出
+                projects[mint]["sell_tokens"] += abs(delta)
+                projects[mint]["sell_sol"] += sol_in_tx
 
-        elif token_change < 0 and sol_change > 0:  # SELL
-            if token_mint in positions and positions[token_mint]:
-                open_pos = positions[token_mint].pop(0)
-                if open_pos['cost_sol'] < MIN_SOL_THRESHOLD: continue
+    # 获取实时行情进行最终清算
+    active_mints = [m for m, v in projects.items() if (v["buy_tokens"] - v["sell_tokens"]) > 0]
+    prices_usd = await get_current_prices(session, active_mints)
+    sol_price_usd = await get_sol_price(session)
 
-                hold_time = (timestamp - open_pos['time']) / 60
-                profit = sol_change - open_pos['cost_sol']
-                roi = profit / open_pos['cost_sol'] if open_pos['cost_sol'] > 0 else 0
+    final_results = []
+    for mint, data in projects.items():
+        if data["buy_sol"] < 0.05: continue  # 过滤极小测试单
 
-                closed_trades.append({
-                    "token": token_mint,
-                    "hold_time": hold_time,
-                    "roi": roi,
-                    "profit": profit,
-                    "cost": open_pos['cost_sol']
-                })
+        remaining_qty = max(0, data["buy_tokens"] - data["sell_tokens"])
+        current_price_sol = (prices_usd.get(mint, 0) / sol_price_usd) if sol_price_usd > 0 else 0
+        unrealized_value = remaining_qty * current_price_sol
 
-    return closed_trades
+        total_value = data["sell_sol"] + unrealized_value
+        net_profit = total_value - data["buy_sol"]
+        roi = (total_value / data["buy_sol"]) - 1 if data["buy_sol"] > 0 else 0
+
+        # 判定卖出进度 (是否已经基本清仓)
+        exit_pct = data["sell_tokens"] / data["buy_tokens"] if data["buy_tokens"] > 0 else 0
+
+        final_results.append({
+            "token": mint,
+            "cost": data["buy_sol"],
+            "profit": net_profit,
+            "roi": roi,
+            "is_win": net_profit > 0,
+            "hold_time": (data["last_time"] - data["first_time"]) / 60,
+            "exit_status": f"{exit_pct:.0%}"
+        })
+
+    return final_results
 
 
-def calculate_score_for_mode(mode, win_rate, median_hold, sniper_rate, profit, max_roi, max_loss, recent_win_rate):
-    """
-    🧠 动态多模式评分算法 (Pro版)
-    引入：max_loss (最大单笔亏损), recent_win_rate (近期状态)
-    """
+def get_detailed_scores(results):
+    """ 增强版评分：看重真实胜率、盈亏比、以及交易多样性 """
+    if not results: return 0, "F", "无数据"
+
+    count = len(results)
+    wins = [r for r in results if r['is_win']]
+    win_rate = len(wins) / count
+    total_profit = sum(r['profit'] for r in results)
+
+    # 核心指标：盈亏比
+    avg_win = sum(r['profit'] for r in wins) / len(wins) if wins else 0
+    losses = [r for r in results if not r['is_win']]
+    avg_loss = abs(sum(r['profit'] for r in losses) / len(losses)) if losses else 0
+    profit_factor = avg_win / avg_loss if avg_loss > 0 else (avg_win if avg_win > 0 else 0)
+
     score = 100
+    # 1. 胜率调整 (以代币为单位的胜率极难造假)
+    if win_rate < 0.4:
+        score -= 30
+    elif win_rate > 0.6:
+        score += 10
 
-    # === 模式 A: 稳健中军 (Conservative) ===
-    if mode == 'conservative':
-        # 1. 胜率 (权重最高)
-        if win_rate < 0.5:
-            score -= 30
-        elif win_rate < 0.6:
-            score -= 10
-        elif win_rate > 0.75:
-            score += 10  # 🔥 加分项：胜率超高
+    # 2. 笔数惩罚 (样本置信度)
+    if count < 5:
+        score *= 0.3
+    elif count < 10:
+        score *= 0.7
 
-        # 2. 风险控制 (核心升级)
-        if max_loss < -0.8:
-            score -= 40  # 单笔腰斩80%，直接不合格
-        elif max_loss < -0.5:
-            score -= 20  # 单笔腰斩50%，扣分
+    # 3. 盈亏比奖励
+    if profit_factor > 3:
+        score += 15
+    elif profit_factor < 1:
+        score -= 20
 
-        # 3. 持仓时间
-        if median_hold < 10: score -= 30
+    # 4. 极端回撤惩罚
+    max_loss_roi = min([r['roi'] for r in results])
+    if max_loss_roi < -0.8: score -= 20
 
-        # 4. 盈利能力
-        if profit < 0: score -= 50
+    score = min(max(0, score), 120)
+    tier = "F"
+    if score >= 100:
+        tier = "S"
+    elif score >= 85:
+        tier = "A"
+    elif score >= 70:
+        tier = "B"
 
-        # 5. 操作频率
-        if sniper_rate > 0.2: score -= 20
-
-        # 6. 近期状态 (防止跟到走下坡路的大哥)
-        if recent_win_rate < 0.4: score -= 15
-
-    # === 模式 B: 激进先锋 (Aggressive) ===
-    elif mode == 'aggressive':
-        if max_roi < 5.0:
-            score -= 40
-        elif max_roi > 20.0:
-            score += 10  # 🔥 加分项：抓到过20倍金狗
-
-        if win_rate < 0.3: score -= 20
-        if profit < 0 and max_roi < 10.0: score -= 30
-
-        if sniper_rate > 0.5: score -= 5
-
-    # === 模式 C: 钻石手 (Diamond) ===
-    elif mode == 'diamond':
-        if median_hold < 60:
-            score -= 50
-        elif median_hold < 1440:
-            score -= 10
-        elif median_hold > 2880:
-            score += 10  # 🔥 加分项：拿单超过2天
-
-        if max_roi < 3.0: score -= 20
-        if sniper_rate > 0.1: score -= 30
-
-    return score  # 现在可以超过100分
-
-
-def get_tier_rating(score):
-    """ 获取评级标签 """
-    if score >= 110: return "SSS", "🦄 传说级 (可遇不可求)"
-    if score >= 100: return "S", "👑 顶级大师 (完美数据)"
-    if score >= 85: return "A", "🔥 优秀高手 (值得重仓)"
-    if score >= 70: return "B", "👌 良好 (可以跟单)"
-    if score >= 60: return "C", "😐 及格 (观察仓位)"
-    return "F", "💩 垃圾/韭菜 (千万别跟)"
+    return round(score, 1), tier, f"盈亏比: {profit_factor:.2f} | 代币数: {count}"
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Auto Identity Analyzer Pro")
-    parser.add_argument("wallet", help="Target Wallet Address")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("wallet")
     args = parser.parse_args()
-    target = args.wallet
 
     async with aiohttp.ClientSession() as session:
-        txs = await fetch_history_pagination(session, target, TARGET_TX_COUNT)
-        if not txs: return
-        trades = parse_trades(txs, target)
-        if not trades: print("⚠️ 无有效交易数据"); return
+        print(f"🔍 正在深度审计 V4: {args.wallet[:6]}...")
+        txs = await fetch_history_pagination(session, args.wallet, TARGET_TX_COUNT)
+        results = await parse_token_projects(session, txs, args.wallet)
 
-        # === 1. 基础数据计算 ===
-        count = len(trades)
-        wins = [t for t in trades if t['roi'] > 0]
-        total_profit = sum(t['profit'] for t in trades)
+        if not results:
+            print("❌ 未发现有效交易项目")
+            return
 
-        hold_times = [t['hold_time'] for t in trades]
-        median_hold = statistics.median(hold_times) if hold_times else 0
+        score, tier, desc = get_detailed_scores(results)
 
-        sniper_txs = [t for t in trades if t['hold_time'] < 2]
-        sniper_rate = len(sniper_txs) / count
-
-        win_rate = len(wins) / count
-        max_roi = max([t['roi'] for t in trades]) if trades else 0
-        min_roi = min([t['roi'] for t in trades]) if trades else 0  # 🔥 最大回撤
-
-        # 计算最近 10 笔的胜率 (Recent Form)
-        recent_trades = trades[-10:]
-        recent_wins = [t for t in recent_trades if t['roi'] > 0]
-        recent_win_rate = len(recent_wins) / len(recent_trades) if recent_trades else 0
-
-        # === 2. 三维雷达扫描 (传入更多参数) ===
-        scores = {
-            "🛡️ 稳健中军": calculate_score_for_mode('conservative', win_rate, median_hold, sniper_rate, total_profit,
-                                                    max_roi, min_roi, recent_win_rate),
-            "⚔️ 土狗猎手": calculate_score_for_mode('aggressive', win_rate, median_hold, sniper_rate, total_profit,
-                                                    max_roi, min_roi, recent_win_rate),
-            "💎 钻石之手": calculate_score_for_mode('diamond', win_rate, median_hold, sniper_rate, total_profit, max_roi,
-                                                   min_roi, recent_win_rate)
-        }
-
-        # 找出最高分
-        best_role, best_score = max(scores.items(), key=lambda item: item[1])
-        tier, tier_desc = get_tier_rating(best_score)
-
-        # === 3. 输出可视化报告 ===
         print("\n" + "═" * 60)
-        print(f"🧬 钱包战力分析报告 (Pro): {target[:6]}...{target[-4:]}")
+        print(f"🧬 战力报告 (V4 全量成本版): {args.wallet[:6]}...")
         print("═" * 60)
+        print(f"📊 核心汇总:")
+        print(
+            f"   • 项目胜率: {len([r for r in results if r['is_win']]) / len(results):.1%} (基于{len(results)}个代币)")
+        print(f"   • 累计利润: {sum(r['profit'] for r in results):+,.2f} SOL")
+        print(f"   • 综合得分: {score} [{tier}级]")
+        print(f"   • 状态评价: {desc}")
 
-        print(f"📊 核心数据:")
-        print(f"   • 总盈亏: {'+' if total_profit > 0 else ''}{total_profit:.2f} SOL")
-        print(f"   • 胜  率: {win_rate:.1%} (近10单: {recent_win_rate:.1%})")
-        print(f"   • 极值: 🚀{max_roi * 100:.0f}% / 📉{min_roi * 100:.1f}% (最大回撤)")
-        print(f"   • 持  仓: {median_hold:.1f} 分钟 (中位数)")
-
-        print("-" * 30)
-        print(f"🎯 身份匹配 (雷达):")
-        for role, sc in scores.items():
-            # 动态进度条，支持超过100分
-            bar_len = min(int(sc / 10), 12)
-            bar = "█" * bar_len + "░" * (12 - bar_len)
-            print(f"   {role}: {bar} {sc}分")
-
-        print("-" * 30)
-        print(f"🏆 综合评级: [{tier}级] {best_score} 分")
-        print(f"📝 评价标签: {tier_desc}")
-        print(f"💡 最佳定位: {best_role}")
-
-        # 智能点评
-        if best_score >= 100:
-            print("✨ 点评: 无论从胜率还是风控看，都是无可挑剔的六边形战士！")
-        elif min_roi < -0.8 and "稳健" in best_role:
-            print("⚠️ 警告: 虽然分数高，但有单笔亏损超过80%的记录，请小心炸雷。")
-
+        print("\n📝 重点项目明细 (按利润排序):")
+        results.sort(key=lambda x: x['profit'], reverse=True)
+        for r in results[:8]:
+            icon = "🟢" if r['is_win'] else "🔴"
+            print(
+                f" {icon} {r['token'][:6]}.. | 利润 {r['profit']:>+7.2f} | ROI {r['roi'] * 100:>+7.1f}% | 退出度 {r['exit_status']}")
         print("═" * 60)
-
-        if count > 0:
-            print("\n📝 最近 5 笔实战:")
-            for t in trades[-5:]:
-                icon = "🟢" if t['roi'] > 0 else "🔴"
-                print(f" {icon} 持仓 {t['hold_time']:>5.1f}m | 投入 {t['cost']:>5.2f} | ROI {t['roi'] * 100:>+6.1f}%")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
