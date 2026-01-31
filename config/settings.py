@@ -49,3 +49,20 @@ SMTP_PORT = 465
 
 # --- 添加 Jupiter API Key 配置 ---
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
+
+# --- 📅 日报发送时间配置 (错峰运行) ---
+# 默认值为 "09:00"
+_daily_time_str = os.getenv("DAILY_REPORT_TIME", "09:00")
+
+try:
+    # 尝试解析 "HH:MM" 格式
+    REPORT_HOUR, REPORT_MINUTE = map(int, _daily_time_str.split(":"))
+    
+    # 简单的范围检查
+    if not (0 <= REPORT_HOUR <= 23 and 0 <= REPORT_MINUTE <= 59):
+        raise ValueError("时间超出范围")
+        
+except ValueError:
+    print(f"⚠️ [配置警告] DAILY_REPORT_TIME 格式错误 ({_daily_time_str})，已重置为默认 09:00")
+    REPORT_HOUR = 9
+    REPORT_MINUTE = 0
