@@ -6,8 +6,6 @@
 @File       : risk_control.py
 @Description: 
 """
-# services/risk_control.py
-from utils.logger import logger
 import aiohttp
 from utils.logger import logger
 
