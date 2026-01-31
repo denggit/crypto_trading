@@ -42,7 +42,8 @@ TAKE_PROFIT_SELL_PCT = float(os.getenv("TAKE_PROFIT_SELL_PCT", 0.5))
 MIN_LIQUIDITY_USD = int(os.getenv("MIN_LIQUIDITY_USD", 3000))           
 MAX_FDV = int(os.getenv("MAX_FDV", 5000000))                            
 MIN_FDV = int(os.getenv("MIN_FDV", 0))                                  
-MIN_SMART_MONEY_COST = float(os.getenv("MIN_SMART_MONEY_COST", 1.0))    
+MIN_SMART_MONEY_COST = float(os.getenv("MIN_SMART_MONEY_COST", 1.0))
+MAX_BUY_TIME = int(os.getenv("MAX_BUY_TIME", 3))
 
 # --- 邮箱配置 ---
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")

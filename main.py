@@ -10,7 +10,8 @@ import argparse
 import asyncio
 import os
 
-from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, MIN_FDV
+from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, \
+    MIN_FDV, MAX_BUY_TIME
 from core.portfolio import PortfolioManager
 from services.risk_control import check_token_liquidity, check_is_honeypot
 from services.solana.monitor import start_monitor, parse_tx, fetch_transaction_details
@@ -64,7 +65,7 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
 
         # 2. 次数限制
         buy_times = pm.get_buy_counts(token)
-        if buy_times >= 3:
+        if buy_times >= MAX_BUY_TIME:
             logger.warning(f"🛑 [风控] {token} 已买入 {buy_times} 次，停止加仓")
             return
 
@@ -92,7 +93,7 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
             
             # 双重检查 (Double Check)
             buy_times = pm.get_buy_counts(token)
-            if buy_times >= 3:
+            if buy_times >= MAX_BUY_TIME:
                 logger.warning(f"🛑 [并发阻断] {token} 次数已满")
                 return
             
