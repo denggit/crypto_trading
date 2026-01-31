@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 @File       : core/portfolio.py
-@Description: 核心资产管理 (支持断电记忆/持久化保存 + 智能去灰尘胜率统计)
+@Description: 核心资产管理 (极致优化版 - 统计计算移至后台线程，确保主线程零阻塞)
 """
 import asyncio
 import json
 import os
 import aiohttp
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 # 导入配置和工具
 from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI
@@ -28,6 +29,9 @@ class PortfolioManager:
         self.trade_history = []  # 历史记录
         self.buy_counts_cache = {}  # 买入次数缓存
         self.is_running = True
+        
+        # 🔥 创建一个独立的线程池，专门用来处理耗时的计算任务
+        self.calc_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="StatsCalc")
 
         # 🔥 初始化时，加载硬盘上的数据
         self._ensure_data_dir()
@@ -35,13 +39,10 @@ class PortfolioManager:
         self._rebuild_buy_counts_cache()
 
     def _ensure_data_dir(self):
-        """ 确保 data 目录存在 """
         if not os.path.exists(DATA_DIR):
             os.makedirs(DATA_DIR)
 
     def _load_data(self):
-        """ 从硬盘加载数据 (恢复记忆) """
-        # 1. 加载持仓
         if os.path.exists(PORTFOLIO_FILE):
             try:
                 with open(PORTFOLIO_FILE, 'r', encoding='utf-8') as f:
@@ -50,7 +51,6 @@ class PortfolioManager:
             except Exception as e:
                 logger.error(f"❌ 读取持仓文件失败: {e}")
 
-        # 2. 加载历史
         if os.path.exists(HISTORY_FILE):
             try:
                 with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
@@ -59,17 +59,14 @@ class PortfolioManager:
                 pass
 
     def _rebuild_buy_counts_cache(self):
-        """ 🚀 启动加速：预先统计历史买入次数 """
         self.buy_counts_cache = {}
         for record in self.trade_history:
             if record.get('action') == 'BUY':
                 token = record.get('token')
                 if token:
                     self.buy_counts_cache[token] = self.buy_counts_cache.get(token, 0) + 1
-        logger.info(f"⚡️ 交易历史缓存已重建，包含 {len(self.buy_counts_cache)} 个代币记录")
 
     def _save_portfolio(self):
-        """ 保存持仓到硬盘 """
         try:
             with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.portfolio, f, indent=4)
@@ -77,7 +74,6 @@ class PortfolioManager:
             logger.error(f"❌ 保存持仓失败: {e}")
 
     def _save_history(self):
-        """ 保存历史到硬盘 """
         try:
             with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.trade_history, f, indent=4)
@@ -85,7 +81,6 @@ class PortfolioManager:
             logger.error(f"❌ 保存历史失败: {e}")
 
     def _record_history(self, action, token, amount, value_sol):
-        """ 记录历史并保存 """
         record = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "action": action,
@@ -94,7 +89,7 @@ class PortfolioManager:
             "value_sol": value_sol
         }
         self.trade_history.append(record)
-        self._save_history()  # 立即保存
+        self._save_history()
 
     def add_position(self, token_mint, amount_bought, cost_sol):
         if token_mint not in self.portfolio:
@@ -102,28 +97,19 @@ class PortfolioManager:
 
         self.portfolio[token_mint]['my_balance'] += amount_bought
         self.portfolio[token_mint]['cost_sol'] += cost_sol
-
-        # 更新缓存
         self.buy_counts_cache[token_mint] = self.buy_counts_cache.get(token_mint, 0) + 1
-
-        # 🔥 立即保存到硬盘
         self._save_portfolio()
-
         self._record_history("BUY", token_mint, amount_bought, cost_sol)
         logger.info(f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']}")
 
     def get_buy_counts(self, token_mint):
-        """ 查询历史买入次数 (O(1)) """
         return self.buy_counts_cache.get(token_mint, 0)
 
     async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
-        # 1. 检查持仓
         if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
             return
 
         logger.info(f"👀 监测到大佬卖出 {token_mint[:6]}... 正在计算比例...")
-
-        # 2. 查询大佬剩余持仓
         smart_money_remaining = await self.trader.get_token_balance(TARGET_WALLET, token_mint)
         total_before_sell = smart_money_sold_amt + smart_money_remaining
 
@@ -137,7 +123,6 @@ class PortfolioManager:
 
         if amount_to_sell < 100: return
 
-        # 3. 执行卖出
         logger.info(f"📉 跟随卖出: {amount_to_sell} (占持仓 {sell_ratio:.2%})")
         success, est_sol_out = await self.trader.execute_swap(
             input_mint=token_mint,
@@ -148,27 +133,20 @@ class PortfolioManager:
 
         if success:
             self.portfolio[token_mint]['my_balance'] -= amount_to_sell
-
-            # 🔥 更新并保存
             if self.portfolio[token_mint]['my_balance'] < 100:
                 del self.portfolio[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
-                
                 logger.info(f"🧹 正在尝试回收账户租金...")
                 await asyncio.sleep(2) 
                 asyncio.create_task(self.trader.close_token_account(token_mint))
 
-            self._save_portfolio()  # 保存
+            self._save_portfolio()
             self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
-
-            # 邮件通知
             msg = f"检测到聪明钱卖出，已跟随卖出。\n\n代币: {token_mint}\n数量: {amount_to_sell}\n比例: {sell_ratio:.1%}"
             asyncio.create_task(send_email_async(f"📉 跟随卖出成功: {token_mint[:6]}...", msg))
 
     async def monitor_sync_positions(self):
-        """ 防断网兜底：检查链上状态与粉尘过滤 """
         logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
-        
         async with aiohttp.ClientSession(trust_env=False) as session:
             while self.is_running:
                 if not self.portfolio:
@@ -179,8 +157,7 @@ class PortfolioManager:
                     try:
                         my_data = self.portfolio[token_mint]
                         if my_data['my_balance'] <= 0: continue
-
-                        # 获取大佬的原始余额
+                        
                         sm_amount_raw = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
                         should_sell = False
                         reason = ""
@@ -189,7 +166,6 @@ class PortfolioManager:
                             should_sell = True
                             reason = "大佬余额为 0"
                         else:
-                            # 价值检查 (Value Check)
                             quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT, sm_amount_raw)
                             if quote:
                                 val_in_sol = int(quote['outAmount']) / 10**9
@@ -208,7 +184,6 @@ class PortfolioManager:
                 await asyncio.sleep(20)
 
     async def monitor_1000x_profit(self):
-        """ 止盈监控 """
         logger.info("💰 收益监控线程已启动...")
         async with aiohttp.ClientSession(trust_env=False) as session:
             while self.is_running:
@@ -219,15 +194,11 @@ class PortfolioManager:
                     try:
                         data = self.portfolio[token_mint]
                         if data['my_balance'] <= 0: continue
-
-                        # 询价
-                        quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
-                                                            data['my_balance'])
+                        quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT, data['my_balance'])
                         if quote:
                             curr_val = int(quote['outAmount'])
                             cost = data['cost_sol']
                             roi = (curr_val / cost) - 1 if cost > 0 else 0
-
                             if roi >= TAKE_PROFIT_ROI:
                                 logger.warning(f"🚀 触发 {roi * 100:.0f}% 止盈！{token_mint} 强平！")
                                 await self.force_sell_all(token_mint, data['my_balance'], roi)
@@ -236,54 +207,117 @@ class PortfolioManager:
                 await asyncio.sleep(10)
 
     async def force_sell_all(self, token_mint, amount, roi):
-        """ 强制卖出辅助函数 """
         success, est_sol_out = await self.trader.execute_swap(
             token_mint, self.trader.SOL_MINT, amount, SLIPPAGE_SELL
         )
         if success:
             if token_mint in self.portfolio:
                 del self.portfolio[token_mint]
-
             logger.info(f"🧹 [强平] 正在尝试回收账户租金...")
             await asyncio.sleep(2)
             asyncio.create_task(self.trader.close_token_account(token_mint))
-
             self._save_portfolio()
             self._record_history("SELL_FORCE", token_mint, amount, est_sol_out)
-
             if roi == -0.99:
                 subject = f"🛡️ 防断网风控: {token_mint[:6]}..."
                 msg = f"检测到聪明钱已清仓，已补救卖出。\n\n代币: {token_mint}"
             else:
                 subject = f"🚀 暴富止盈: {token_mint[:6]}..."
                 msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出"
-
             asyncio.create_task(send_email_async(subject, msg))
 
     async def schedule_daily_report(self):
-        """ 每日日报调度器 """
         logger.info("📅 日报调度器已启动 (每天 09:00 发送)...")
         while self.is_running:
             now = datetime.now()
             target_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-
             if now >= target_time:
                 target_time += timedelta(days=1)
-
             sleep_seconds = (target_time - now).total_seconds()
             logger.info(f"⏳ 距离发送日报还有 {sleep_seconds / 3600:.1f} 小时")
-
             await asyncio.sleep(sleep_seconds)
             await self.send_daily_summary()
             await asyncio.sleep(60)
 
+    # 🔥🔥🔥 核心升级：这是运行在后台线程的纯 CPU 计算函数 🔥🔥🔥
+    @staticmethod
+    def _calculate_stats_worker(history_snapshot, yesterday_timestamp):
+        """ 
+        这个函数会在独立的线程中运行，绝对不会阻塞主线程 
+        """
+        temp_holdings = {}
+        temp_costs = {}
+        
+        daily_profit_sol = 0.0
+        total_realized_profit_sol = 0.0
+        
+        daily_wins = 0
+        daily_losses = 0
+        total_wins = 0
+        total_losses = 0
+
+        COST_THRESHOLD_FOR_WINRATE = 0.01 
+
+        for record in history_snapshot:
+            token = record['token']
+            action = record['action']
+            amount = record['amount']
+            val = record['value_sol']
+            
+            try:
+                # 这一步其实挺慢的，现在放在子线程里就很安全了
+                rec_time = datetime.strptime(record['time'], "%Y-%m-%d %H:%M:%S")
+            except:
+                continue 
+
+            if action == 'BUY':
+                temp_holdings[token] = temp_holdings.get(token, 0) + amount
+                temp_costs[token] = temp_costs.get(token, 0.0) + val
+                
+            elif 'SELL' in action:
+                current_holding = temp_holdings.get(token, 0)
+                total_cost = temp_costs.get(token, 0.0)
+                
+                if current_holding > 0:
+                    avg_price = total_cost / current_holding
+                    cost_of_this_sell = avg_price * amount
+                    
+                    pnl = val - cost_of_this_sell
+                    total_realized_profit_sol += pnl
+                    
+                    # 比较时间戳
+                    is_today = rec_time >= yesterday_timestamp
+                    if is_today:
+                        daily_profit_sol += pnl
+
+                    if cost_of_this_sell > COST_THRESHOLD_FOR_WINRATE:
+                        if pnl > 0:
+                            total_wins += 1
+                            if is_today: daily_wins += 1
+                        else:
+                            total_losses += 1
+                            if is_today: daily_losses += 1
+                    
+                    temp_holdings[token] = max(0, current_holding - amount)
+                    temp_costs[token] = max(0.0, total_cost - cost_of_this_sell)
+
+        return {
+            "daily_profit_sol": daily_profit_sol,
+            "total_realized_profit_sol": total_realized_profit_sol,
+            "daily_wins": daily_wins,
+            "daily_losses": daily_losses,
+            "total_wins": total_wins,
+            "total_losses": total_losses,
+            "sell_count": sum(1 for x in history_snapshot if 'SELL' in x['action'])
+        }
+
     async def send_daily_summary(self):
-        """ 生成并发送日报 (含当日盈亏 & 累计历史盈亏 & 智能胜率) """
+        """ 生成并发送日报 (异步无阻塞版) """
         logger.info("📊 正在生成每日日报...")
         
         async with aiohttp.ClientSession(trust_env=True) as session:
             try:
-                # 1. 基础数据获取
+                # 1. IO 操作：获取价格和余额 (本身就是 Async，不卡顿)
                 usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
                 quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
                 sol_price = float(quote['outAmount']) / 10 ** 6 if quote else 0
@@ -291,7 +325,7 @@ class PortfolioManager:
                 balance_resp = await self.trader.rpc_client.get_balance(self.trader.payer.pubkey())
                 sol_balance = balance_resp.value / 10 ** 9
 
-                # 2. 持仓价值
+                # 2. IO 操作：计算持仓价值 (Async)
                 holdings_val_sol = 0
                 holdings_details = ""
                 if self.portfolio:
@@ -306,79 +340,38 @@ class PortfolioManager:
                 total_asset_sol = sol_balance + holdings_val_sol
                 total_asset_usd = total_asset_sol * sol_price
 
-                # --- 3. 核心计算：盈亏回放 & 智能胜率 ---
+                # --- 🔥 3. CPU 密集操作：扔到线程池去跑！🔥 ---
                 yesterday = datetime.now() - timedelta(days=1)
                 
-                temp_holdings = {}
-                temp_costs = {}
-                
-                daily_profit_sol = 0.0
-                total_realized_profit_sol = 0.0
-                
-                # 胜率计数器
-                daily_wins = 0
-                daily_losses = 0
-                total_wins = 0
-                total_losses = 0
+                # 关键：先在主线程做一个数据的浅拷贝 (非常快，微秒级)，避免线程竞争
+                history_snapshot = list(self.trade_history)
 
-                # 🔥 灰尘单过滤阈值 (成本低于 0.01 SOL 的卖出不计入胜率)
-                # 逻辑：如果是 RugPull，成本肯定 > 0.01，会算作亏损（Valid）。
-                #       如果是扫尾货，成本极低，会被忽略。
-                COST_THRESHOLD_FOR_WINRATE = 0.01 
+                # 将繁重的计算任务移交给后台线程
+                # loop.run_in_executor(None, ...) 会使用默认的 ThreadPoolExecutor 或我们自己定义的
+                loop = asyncio.get_event_loop()
+                stats = await loop.run_in_executor(
+                    self.calc_executor, 
+                    self._calculate_stats_worker, 
+                    history_snapshot, 
+                    yesterday
+                )
+                # ---------------------------------------------
 
-                for record in self.trade_history:
-                    token = record['token']
-                    action = record['action']
-                    amount = record['amount']
-                    val = record['value_sol']
-                    
-                    try:
-                        rec_time = datetime.strptime(record['time'], "%Y-%m-%d %H:%M:%S")
-                    except:
-                        continue 
-
-                    if action == 'BUY':
-                        temp_holdings[token] = temp_holdings.get(token, 0) + amount
-                        temp_costs[token] = temp_costs.get(token, 0.0) + val
-                        
-                    elif 'SELL' in action:
-                        current_holding = temp_holdings.get(token, 0)
-                        total_cost = temp_costs.get(token, 0.0)
-                        
-                        if current_holding > 0:
-                            avg_price = total_cost / current_holding
-                            cost_of_this_sell = avg_price * amount
-                            
-                            # 1. 算钱 (所有卖出都算钱，一分钱也是钱)
-                            pnl = val - cost_of_this_sell
-                            total_realized_profit_sol += pnl
-                            
-                            is_today = rec_time >= yesterday
-                            if is_today:
-                                daily_profit_sol += pnl
-
-                            # 2. 算胜率 (智能过滤灰尘)
-                            # 只有当这笔卖出的“成本投入”大于阈值时，才认为是一次有效博弈
-                            if cost_of_this_sell > COST_THRESHOLD_FOR_WINRATE:
-                                if pnl > 0:
-                                    total_wins += 1
-                                    if is_today: daily_wins += 1
-                                else:
-                                    total_losses += 1
-                                    if is_today: daily_losses += 1
-                            
-                            # 更新剩余
-                            temp_holdings[token] = max(0, current_holding - amount)
-                            temp_costs[token] = max(0.0, total_cost - cost_of_this_sell)
+                # 取出数据
+                daily_profit_sol = stats["daily_profit_sol"]
+                total_realized_profit_sol = stats["total_realized_profit_sol"]
+                daily_wins = stats["daily_wins"]
+                daily_losses = stats["daily_losses"]
+                total_wins = stats["total_wins"]
+                total_losses = stats["total_losses"]
 
                 # 计算百分比
-                daily_total_valid_trades = daily_wins + daily_losses
-                daily_win_rate = (daily_wins / daily_total_valid_trades * 100) if daily_total_valid_trades > 0 else 0.0
+                daily_total = daily_wins + daily_losses
+                daily_win_rate = (daily_wins / daily_total * 100) if daily_total > 0 else 0.0
                 
-                total_valid_trades = total_wins + total_losses
-                total_win_rate = (total_wins / total_valid_trades * 100) if total_valid_trades > 0 else 0.0
+                total_valid = total_wins + total_losses
+                total_win_rate = (total_wins / total_valid * 100) if total_valid > 0 else 0.0
                 
-                # USD 估值
                 daily_profit_usd = daily_profit_sol * sol_price
                 total_profit_usd = total_realized_profit_sol * sol_price
 
@@ -394,7 +387,7 @@ class PortfolioManager:
 • 持仓价值: {holdings_val_sol:.4f} SOL
 • 总计资产: {total_asset_sol:.4f} SOL (≈ ${total_asset_usd:.2f})
 
-📈 战绩统计:
+📈 战绩统计 (去灰尘版):
 -------------------
 • 今日已结盈亏: {'+' if daily_profit_sol >= 0 else ''}{daily_profit_sol:.4f} SOL
 • 今日有效胜率: {daily_win_rate:.1f}% ({daily_wins} 胜 / {daily_losses} 负)
@@ -403,15 +396,15 @@ class PortfolioManager:
 -------------------
 • 累计已结盈亏: {'+' if total_realized_profit_sol >= 0 else ''}{total_realized_profit_sol:.4f} SOL (≈ ${total_profit_usd:.2f})
 • 累计有效胜率: {total_win_rate:.1f}% ({total_wins} 胜 / {total_losses} 负)
-• 累计交易笔数: {sum(1 for x in self.trade_history if 'SELL' in x['action'])} (含灰尘)
+• 累计交易笔数: {stats['sell_count']} (含灰尘)
 
 👜 当前持仓明细:
 {holdings_details if holdings_details else "(空仓)"}
 
-🤖 机器人状态: 正常运行中
+🤖 机器人状态: 正常运行中 (零阻塞模式)
 """
                 await send_email_async("📊 [日报] 资产与盈亏统计", report, attachment_path=PORTFOLIO_FILE)
-                logger.info("✅ 日报已发送 (含智能胜率统计)")
+                logger.info("✅ 日报已发送")
 
             except Exception as e:
                 logger.error(f"生成日报失败: {e}")
