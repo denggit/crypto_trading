@@ -135,6 +135,8 @@ async def test_portfolio_manager():
     core.portfolio.PORTFOLIO_FILE = temp_portfolio
     core.portfolio.HISTORY_FILE = temp_history
 
+    pm = None # 初始化变量
+
     try:
         trader = SolanaTrader(RPC_URL)
         pm = PortfolioManager(trader)
@@ -142,26 +144,46 @@ async def test_portfolio_manager():
         # 这个操作现在只会写到垃圾文件里
         pm.add_position("TEST_TOKEN_JUP", 1000, 0.1)
 
+        # 稍微给一点时间让后台线程完成写入 (这是新版改动引入的特性)
+        await asyncio.sleep(0.5) 
+
         if "TEST_TOKEN_JUP" in pm.portfolio:
             logger.info("✅ 记账功能正常 (已写入临时文件)")
             result = True
         else:
+            logger.error("❌ 记账失败：内存中未找到代币")
             result = False
 
     except Exception as e:
         logger.error(f"❌ 仓位管理失败: {e}")
+        logger.error(traceback.format_exc()) # 打印堆栈以便排查
         result = False
 
     finally:
+        # 🔥🔥🔥 新增：显式关闭线程池，防止脚本卡死 🔥🔥🔥
+        if pm and hasattr(pm, 'calc_executor'):
+            pm.calc_executor.shutdown(wait=False)
+        # ------------------------------------------------
+
         # 🔥 3. 还原：把路径改回去，防止影响后续逻辑
         core.portfolio.PORTFOLIO_FILE = original_portfolio_file
         core.portfolio.HISTORY_FILE = original_history_file
 
         # 🔥 4. 扫地：删除生成的临时文件
         if os.path.exists(temp_portfolio):
-            os.remove(temp_portfolio)
+            try:
+                os.remove(temp_portfolio)
+            except: pass
         if os.path.exists(temp_history):
-            os.remove(temp_history)
+            try:
+                os.remove(temp_history)
+            except: pass
+        
+        # 删除可能产生的 .tmp 临时文件
+        if os.path.exists(temp_portfolio + ".tmp"):
+            try: os.remove(temp_portfolio + ".tmp")
+            except: pass
+            
         logger.info("🧹 临时测试数据已清理")
 
     return result
