@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 @File       : analyze_wallet.py
-@Description: 智能钱包画像识别 V4 (代币全量成本法 + 实时行情修正)
+@Description: 智能钱包画像识别 V4 Pro (全量成本算法 + 视觉增强系统)
 """
 import asyncio
 import os
@@ -50,10 +50,9 @@ async def fetch_history_pagination(session, address, max_count=3000):
 
 
 async def get_current_prices(session, token_mints):
-    """ 批量获取代币当前价格 (DexScreener) """
+    """ 批量获取实时价格 """
     if not token_mints: return {}
     prices = {}
-    # 分批请求，防止 URL 过长
     mints_list = list(token_mints)
     for i in range(0, len(mints_list), 30):
         chunk = mints_list[i:i + 30]
@@ -72,7 +71,7 @@ async def get_current_prices(session, token_mints):
 
 
 async def get_sol_price(session):
-    """ 获取当前 SOL 价格用于换算 """
+    """ 获取 SOL 价格 """
     try:
         async with session.get(
                 "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112") as resp:
@@ -83,17 +82,10 @@ async def get_sol_price(session):
 
 
 async def parse_token_projects(session, transactions, target_wallet):
-    """
-    V4 核心算法：以代币为单位的“全量统计法”
-    计算逻辑：(已卖SOL + 剩余价值) / 总投入成本 - 1
-    """
+    """ V4 核心算法：以代币为单位的全量统计法 """
     projects = defaultdict(lambda: {
-        "buy_sol": 0.0,
-        "sell_sol": 0.0,
-        "buy_tokens": 0.0,
-        "sell_tokens": 0.0,
-        "first_time": 0,
-        "last_time": 0
+        "buy_sol": 0.0, "sell_sol": 0.0, "buy_tokens": 0.0, "sell_tokens": 0.0,
+        "first_time": 0, "last_time": 0
     })
 
     for tx in reversed(transactions):
@@ -101,7 +93,6 @@ async def parse_token_projects(session, transactions, target_wallet):
         sol_in_tx = 0
         token_changes = defaultdict(float)
 
-        # 统计 SOL 变动 (原生 + WSOL)
         for nt in tx.get('nativeTransfers', []):
             if nt['fromUserAccount'] == target_wallet: sol_in_tx -= nt['amount'] / 1e9
             if nt['toUserAccount'] == target_wallet: sol_in_tx += nt['amount'] / 1e9
@@ -116,99 +107,85 @@ async def parse_token_projects(session, transactions, target_wallet):
                 if tt['fromUserAccount'] == target_wallet: token_changes[mint] -= amt
                 if tt['toUserAccount'] == target_wallet: token_changes[mint] += amt
 
-        # 将变动归档到代币项目
         for mint, delta in token_changes.items():
             if projects[mint]["first_time"] == 0: projects[mint]["first_time"] = timestamp
             projects[mint]["last_time"] = timestamp
-
-            if delta > 0:  # 买入
+            if delta > 0:
                 projects[mint]["buy_tokens"] += delta
                 projects[mint]["buy_sol"] += abs(sol_in_tx)
-            elif delta < 0:  # 卖出
+            elif delta < 0:
                 projects[mint]["sell_tokens"] += abs(delta)
                 projects[mint]["sell_sol"] += sol_in_tx
 
-    # 获取实时行情进行最终清算
     active_mints = [m for m, v in projects.items() if (v["buy_tokens"] - v["sell_tokens"]) > 0]
     prices_usd = await get_current_prices(session, active_mints)
     sol_price_usd = await get_sol_price(session)
 
     final_results = []
     for mint, data in projects.items():
-        if data["buy_sol"] < 0.05: continue  # 过滤极小测试单
-
-        remaining_qty = max(0, data["buy_tokens"] - data["sell_tokens"])
-        current_price_sol = (prices_usd.get(mint, 0) / sol_price_usd) if sol_price_usd > 0 else 0
-        unrealized_value = remaining_qty * current_price_sol
-
-        total_value = data["sell_sol"] + unrealized_value
-        net_profit = total_value - data["buy_sol"]
-        roi = (total_value / data["buy_sol"]) - 1 if data["buy_sol"] > 0 else 0
-
-        # 判定卖出进度 (是否已经基本清仓)
+        if data["buy_sol"] < 0.05: continue
+        rem = max(0, data["buy_tokens"] - data["sell_tokens"])
+        curr_p = (prices_usd.get(mint, 0) / sol_price_usd) if sol_price_usd > 0 else 0
+        unrealized = rem * curr_p
+        total_val = data["sell_sol"] + unrealized
+        net_profit = total_val - data["buy_sol"]
+        roi = (total_val / data["buy_sol"]) - 1 if data["buy_sol"] > 0 else 0
         exit_pct = data["sell_tokens"] / data["buy_tokens"] if data["buy_tokens"] > 0 else 0
 
         final_results.append({
-            "token": mint,
-            "cost": data["buy_sol"],
-            "profit": net_profit,
-            "roi": roi,
-            "is_win": net_profit > 0,
-            "hold_time": (data["last_time"] - data["first_time"]) / 60,
+            "token": mint, "cost": data["buy_sol"], "profit": net_profit, "roi": roi,
+            "is_win": net_profit > 0, "hold_time": (data["last_time"] - data["first_time"]) / 60,
             "exit_status": f"{exit_pct:.0%}"
         })
-
     return final_results
 
 
 def get_detailed_scores(results):
-    """ 增强版评分：看重真实胜率、盈亏比、以及交易多样性 """
-    if not results: return 0, "F", "无数据"
+    """ 综合评分与雷达数据生成 """
+    if not results: return 0, "F", "无数据", {}
 
     count = len(results)
     wins = [r for r in results if r['is_win']]
     win_rate = len(wins) / count
     total_profit = sum(r['profit'] for r in results)
+    median_hold = statistics.median([r['hold_time'] for r in results])
 
-    # 核心指标：盈亏比
     avg_win = sum(r['profit'] for r in wins) / len(wins) if wins else 0
     losses = [r for r in results if not r['is_win']]
     avg_loss = abs(sum(r['profit'] for r in losses) / len(losses)) if losses else 0
     profit_factor = avg_win / avg_loss if avg_loss > 0 else (avg_win if avg_win > 0 else 0)
 
-    score = 100
-    # 1. 胜率调整 (以代币为单位的胜率极难造假)
+    # 基础分
+    base_score = 100
     if win_rate < 0.4:
-        score -= 30
+        base_score -= 30
     elif win_rate > 0.6:
-        score += 10
+        base_score += 10
 
-    # 2. 笔数惩罚 (样本置信度)
+    # 样本置信度惩罚
+    conf_multiplier = 1.0
     if count < 5:
-        score *= 0.3
+        conf_multiplier = 0.3
     elif count < 10:
-        score *= 0.7
+        conf_multiplier = 0.7
 
-    # 3. 盈亏比奖励
-    if profit_factor > 3:
-        score += 15
-    elif profit_factor < 1:
-        score -= 20
+    # 雷达图逻辑
+    radar = {
+        "🛡️ 稳健中军": int(max(0, base_score - (30 if median_hold < 10 else 0)) * conf_multiplier),
+        "⚔️ 土狗猎手": int(max(0, base_score + (20 if profit_factor > 3 else 0)) * conf_multiplier),
+        "💎 钻石之手": int(max(0, base_score - (40 if median_hold < 60 else 0)) * conf_multiplier)
+    }
 
-    # 4. 极端回撤惩罚
-    max_loss_roi = min([r['roi'] for r in results])
-    if max_loss_roi < -0.8: score -= 20
-
-    score = min(max(0, score), 120)
+    final_score = max(radar.values())
     tier = "F"
-    if score >= 100:
+    if final_score >= 100:
         tier = "S"
-    elif score >= 85:
+    elif final_score >= 85:
         tier = "A"
-    elif score >= 70:
+    elif final_score >= 70:
         tier = "B"
 
-    return round(score, 1), tier, f"盈亏比: {profit_factor:.2f} | 代币数: {count}"
+    return final_score, tier, f"盈亏比: {profit_factor:.2f} | 代币数: {count}", radar
 
 
 async def main():
@@ -217,7 +194,7 @@ async def main():
     args = parser.parse_args()
 
     async with aiohttp.ClientSession() as session:
-        print(f"🔍 正在深度审计 V4: {args.wallet[:6]}...")
+        print(f"🔍 正在深度审计 V4 Pro: {args.wallet[:6]}...")
         txs = await fetch_history_pagination(session, args.wallet, TARGET_TX_COUNT)
         results = await parse_token_projects(session, txs, args.wallet)
 
@@ -225,17 +202,35 @@ async def main():
             print("❌ 未发现有效交易项目")
             return
 
-        score, tier, desc = get_detailed_scores(results)
+        score, tier, desc, radar = get_detailed_scores(results)
 
         print("\n" + "═" * 60)
-        print(f"🧬 战力报告 (V4 全量成本版): {args.wallet[:6]}...")
+        print(f"🧬 战力报告 (V4 Pro): {args.wallet[:6]}...{args.wallet[-4:]}")
         print("═" * 60)
         print(f"📊 核心汇总:")
         print(
             f"   • 项目胜率: {len([r for r in results if r['is_win']]) / len(results):.1%} (基于{len(results)}个代币)")
         print(f"   • 累计利润: {sum(r['profit'] for r in results):+,.2f} SOL")
-        print(f"   • 综合得分: {score} [{tier}级]")
-        print(f"   • 状态评价: {desc}")
+        print(f"   • 持仓中位: {statistics.median([r['hold_time'] for r in results]):.1f} 分钟")
+
+        print("-" * 30)
+        print(f"🎯 战力雷达 (置信度:{'高' if len(results) > 10 else '低'}):")
+        for role, sc in radar.items():
+            bar = "█" * (sc // 10) + "░" * (10 - (sc // 10))
+            print(f"   {role}: {bar} {sc}分")
+
+        print("-" * 30)
+        print(f"🏆 综合评级: [{tier}级] {score} 分")
+        print(f"📝 状态评价: {desc}")
+
+        # 战术建议
+        if tier in ["S", "A"]:
+            best_role = max(radar, key=radar.get)
+            print(f"🚀 最佳定位: {best_role}")
+            print(f"✅ 建议配置: {'Bot B (稳健)' if '稳健' in best_role else 'Bot A (激进)'}")
+        else:
+            print("❌ 建议配置: 不推荐跟单 (样本不足或表现不佳)")
+        print("═" * 60)
 
         print("\n📝 重点项目明细 (按利润排序):")
         results.sort(key=lambda x: x['profit'], reverse=True)
