@@ -1,3 +1,7 @@
 /.env
 /log/
 /data/
+/.env_bota
+/.env_botb
+/.env_botc
+/tools/wallets.txt
