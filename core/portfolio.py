@@ -22,7 +22,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 
 
 class PortfolioManager:
-def __init__(self, trader):
+    def __init__(self, trader):
         self.trader = trader
         self.portfolio = {}  
         self.trade_history = [] 

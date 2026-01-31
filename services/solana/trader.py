@@ -21,7 +21,6 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 from spl.token.instructions import close_account, CloseAccountParams
 from spl.token.constants import TOKEN_PROGRAM_ID
-from solana.transaction import Transaction
 
 from config.settings import PRIVATE_KEY, JUPITER_API_KEY
 from utils.logger import logger
@@ -204,14 +203,14 @@ class SolanaTrader:
             except Exception as e:
                 logger.error(f"❌ 交易执行异常: {e}")
                 return False, 0
-                
+
     async def close_token_account(self, token_mint_str):
         """ 🔥 回收租金：关闭空的代币账户，拿回 0.002 SOL """
         try:
             # 1. 查找该代币的 ATA (关联账户)
             opts = TokenAccountOpts(mint=Pubkey.from_string(token_mint_str))
             resp = await self.rpc_client.get_token_accounts_by_owner(self.payer.pubkey(), opts)
-            
+
             if not resp.value:
                 logger.info(f"⚠️ 账户不存在，无需关闭: {token_mint_str}")
                 return False
@@ -219,7 +218,6 @@ class SolanaTrader:
             token_account_pubkey = resp.value[0].pubkey
 
             # 2. 构建关闭指令 (CloseAccount)
-            # 逻辑：把 token_account_pubkey 关闭，剩下的 SOL 转给 self.payer.pubkey()
             close_ix = close_account(
                 CloseAccountParams(
                     account=token_account_pubkey,
@@ -229,20 +227,14 @@ class SolanaTrader:
                 )
             )
 
-            # 3. 构建并发送交易 (使用传统 Transaction 格式即可)
-            tx = Transaction().add(close_ix)
+            # 3. 构建并发送交易 (Versioned Transaction)
             # 获取最新的 blockhash
             latest_blockhash = await self.rpc_client.get_latest_blockhash()
-            tx.recent_blockhash = latest_blockhash.value.blockhash
-            
-            # 签名并发送
-            tx.sign(self.payer)
-            # 发送 (注意：这里直接发 raw transaction)
-            # 由于 solana-py 版本差异，这里用最通用的方式
+
+            # 直接使用 solders 构建 Versioned 交易 (这是 0.30+ 版本的正确写法)
             from solders.transaction import VersionedTransaction
             from solders.message import MessageV0
-            
-            # 重新封装为 Versioned 交易以兼容现在的发送逻辑 (更稳妥)
+
             msg = MessageV0.try_compile(
                 self.payer.pubkey(),
                 [close_ix],
@@ -250,15 +242,14 @@ class SolanaTrader:
                 latest_blockhash.value.blockhash,
             )
             vtx = VersionedTransaction(msg, [self.payer])
-            
+
             opts = TxOpts(skip_preflight=True)
             await self.rpc_client.send_transaction(vtx, opts=opts)
-            
+
             logger.info(f"♻️ [房租回收] 成功关闭账户，回血 +0.002 SOL")
             return True
 
         except Exception as e:
-            # 账户没清干净(有粉尘)会导致关闭失败，这是正常的，不报错
             logger.warning(f"⚠️ 关闭账户失败 (可能由粉尘残留导致): {e}")
             return False
 
