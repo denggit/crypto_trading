@@ -8,10 +8,14 @@
 """
 # config/settings.py
 import os
+from pathlib import Path
+
+# 获取项目根目录 (假设 settings.py 在 config/ 下，往上找两层)
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BASE_DIR / ".env"
 
 from dotenv import load_dotenv
-
-load_dotenv()
+load_dotenv(dotenv_path=ENV_PATH) # 🔥 强制指定绝对路径
 
 # --- API Keys ---
 API_KEY = os.getenv("API_KEY")
