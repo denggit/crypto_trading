@@ -22,20 +22,33 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 
 
 class PortfolioManager:
-    def __init__(self, trader):
+def __init__(self, trader):
         self.trader = trader
-        self.portfolio = {}  # 当前持仓
-        self.trade_history = []  # 历史记录
+        self.portfolio = {}  
+        self.trade_history = [] 
+        self.buy_counts_cache = {}  # 🔥 1. 新增：买入次数缓存字典
         self.is_running = True
 
-        # 🔥 初始化时，加载硬盘上的数据
         self._ensure_data_dir()
         self._load_data()
+        
+        # 🔥 2. 新增：启动时预计算所有代币的买入次数
+        self._rebuild_buy_counts_cache()
 
     def _ensure_data_dir(self):
         """ 确保 data 目录存在 """
         if not os.path.exists(DATA_DIR):
             os.makedirs(DATA_DIR)
+
+    def _rebuild_buy_counts_cache(self):
+        """ 🚀 启动加速：预先统计历史买入次数 """
+        self.buy_counts_cache = {}
+        for record in self.trade_history:
+            if record.get('action') == 'BUY':
+                token = record.get('token')
+                if token:
+                    self.buy_counts_cache[token] = self.buy_counts_cache.get(token, 0) + 1
+        logger.info(f"⚡️ 交易历史缓存已重建，包含 {len(self.buy_counts_cache)} 个代币记录")
 
     def _load_data(self):
         """ 从硬盘加载数据 (恢复记忆) """
@@ -91,11 +104,21 @@ class PortfolioManager:
         self.portfolio[token_mint]['my_balance'] += amount_bought
         self.portfolio[token_mint]['cost_sol'] += cost_sol
 
+        # 🔥 3. 实时更新缓存 (O(1) 极速)
+        self.buy_counts_cache[token_mint] = self.buy_counts_cache.get(token_mint, 0) + 1
+
         # 🔥 立即保存到硬盘
         self._save_portfolio()
 
         self._record_history("BUY", token_mint, amount_bought, cost_sol)
         logger.info(f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']}")
+
+    def get_buy_counts(self, token_mint):
+        """ 
+        🔥 查询某个代币的历史买入次数 (优化版)
+        复杂度: O(1) - 瞬间返回，无惧历史数据膨胀
+        """
+        return self.buy_counts_cache.get(token_mint, 0)
 
     async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
         # 1. 检查持仓
