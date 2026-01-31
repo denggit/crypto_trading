@@ -7,13 +7,17 @@
 import asyncio
 import os
 import sys
-import pandas as pd
-import aiohttp
 from datetime import datetime
+
+import aiohttp
+import pandas as pd
 from tqdm.asyncio import tqdm
 
 # 确保能找到 analyze_wallet 模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+if not os.path.exists("results"):
+    os.mkdir("results")
+
 try:
     from analyze_wallet import (
         fetch_history_pagination,
