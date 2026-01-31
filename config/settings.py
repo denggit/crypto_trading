@@ -25,7 +25,7 @@ RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={API_KEY}"
 
 # --- 策略配置 ---
 COPY_AMOUNT_SOL = 0.1
-SLIPPAGE_BUY = 1500
+SLIPPAGE_BUY = 1000
 SLIPPAGE_SELL = 2000
 TAKE_PROFIT_ROI = 10.0
 
