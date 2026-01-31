@@ -23,13 +23,14 @@ MIN_SOL_THRESHOLD = 0.1
 
 # =================
 
-async def fetch_history_pagination(session, address, max_count=1000):
-    """ 自动翻页拉取交易记录 """
+async def fetch_history_pagination(session, address, max_count=2000):
+    """ 自动翻页拉取交易记录 (带 429 自动重试机制) """
     all_txs = []
     last_signature = None
+    retry_count = 0
+    max_retries = 5  # 最多重试 5 次
 
-    print(f"🔍 正在深度审计: {address[:6]}... (自动画像中)")
-    print(f"🎯 目标样本: {max_count} 条 (挖掘数据...)")
+    print(f"🔍 正在深度审计: {address[:6]}...")
 
     while len(all_txs) < max_count:
         batch_limit = 100
@@ -39,9 +40,24 @@ async def fetch_history_pagination(session, address, max_count=1000):
 
         try:
             async with session.get(url, params=params) as resp:
+                if resp.status == 429:
+                    # 🔥 核心：遇到 429 聪明地躲避
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        print(f"🛑 [429] 达到最大重试次数，放弃该钱包")
+                        break
+
+                    wait_time = retry_count * 2  # 第一次等2秒，第二次4秒，以此类推
+                    print(f"⚠️  [429] 触发频率限制，正在等待 {wait_time} 秒后重试 ({retry_count}/{max_retries})...")
+                    await asyncio.sleep(wait_time)
+                    continue  # 继续下一次循环，重试当前请求
+
                 if resp.status != 200:
                     print(f"❌ API 错误: {resp.status}")
                     break
+
+                # 请求成功，重置重试计数
+                retry_count = 0
                 data = await resp.json()
                 if not data: break
 
@@ -49,7 +65,9 @@ async def fetch_history_pagination(session, address, max_count=1000):
                 last_signature = data[-1].get('signature')
 
                 if len(data) < batch_limit: break
-                await asyncio.sleep(0.1)
+                # 适当增加页间延迟，保护 API
+                await asyncio.sleep(0.2)
+
         except Exception as e:
             print(f"❌ 网络异常: {e}")
             break
