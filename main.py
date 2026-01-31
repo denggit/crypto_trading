@@ -72,28 +72,24 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
         logger.info(f"🔍 体检通过: 池子 ${liq:,.0f} | 余额充足 {my_balance:.2f} SOL | 第 {buy_times + 1} 次买入")
 
         # 🔥🔥🔥 核心修改：加锁检查 🔥🔥🔥
-        async with pm.lock:
-            # 在锁内再次检查次数 (Double Check)
+        # 🔥🔥🔥 优化后：只锁当前 Token 🔥🔥🔥
+        # 这样 Token A 的买入不会阻塞 Token B 的买入
+        async with pm.get_token_lock(token):
+            
+            # 双重检查 (Double Check)
             buy_times = pm.get_buy_counts(token)
             if buy_times >= 3:
-                logger.warning(f"🛑 [并发阻断] {token} 已买入 {buy_times} 次，停止加仓")
+                logger.warning(f"🛑 [并发阻断] {token} 次数已满")
                 return
             
-            # 先占位！告诉别的线程“我要买了”，防止它们进来
-            # (这里虽然还没买成功，但必须先计数，或者用一个 pending 状态)
-            # 更加简单的做法是：把 execute_swap 也放在锁里，
-            # 虽然会降低一点点并发度，但能绝对保证安全。
-            
-            logger.info(f"🔒 获得锁，准备买入 {token}...")
-            
+            # 执行买入
             amount_in = int(COPY_AMOUNT_SOL * 10 ** 9)
-            success, est_out = await pm.trader.execute_swap(
-                pm.trader.SOL_MINT, token, amount_in, SLIPPAGE_BUY
-            )
+            success, est_out = await pm.trader.execute_swap(...)
             if success:
                 pm.add_position(token, est_out, amount_in)
 
     elif trade['action'] == "SELL":
+        # 卖出逻辑完全不用锁，飞快执行
         await pm.execute_proportional_sell(token, trade['amount'])
 
 
