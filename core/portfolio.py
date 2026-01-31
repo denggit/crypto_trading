@@ -136,12 +136,16 @@ class PortfolioManager:
     def get_sell_counts(self, token_mint):
         return self.sell_counts_cache.get(token_mint, 0)
 
-    async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
+    async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):        
         # 1. 检查持仓
         if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
             return
 
         logger.info(f"👀 监测到大佬卖出 {token_mint[:6]}... 正在计算策略...")
+
+        # 🔥 初始化变量 (放到最前面！)
+        is_force_clear = False
+        reason_msg = ""
 
         # 2. 先把卖出比例算出来
         smart_money_remaining = await self.trader.get_token_balance(TARGET_WALLET, token_mint)
@@ -150,45 +154,46 @@ class PortfolioManager:
         sell_ratio = 1.0
         if total_before_sell > 0:
             sell_ratio = smart_money_sold_amt / total_before_sell
-            # 🔥🔥🔥 修改点：大哥卖出超过 90% 即视为清仓 🔥🔥🔥
+            
+            # 🔥 策略 A：90% 阈值清仓 (直接修改 is_force_clear)
             if sell_ratio > 0.90: 
+                is_force_clear = True
                 sell_ratio = 1.0
+                reason_msg = f"(卖出比例 {sell_ratio:.1%} > 90% -> 触发清仓)"
 
-        # 3. 策略判断：回合制 + 试盘过滤
+        # 3. 策略 B：回合制 + 试盘过滤
         total_buys = self.get_buy_counts(token_mint)
         current_sell_seq = self.get_sell_counts(token_mint) + 1 
         
-        is_force_clear = False
-        reason_msg = ""
-        
-        # 定义什么是“试盘”：卖出比例小于 5%
         is_tiny_sell = sell_ratio < 0.05 
         
-        # 逻辑 A: 正常清仓 (次数到了，且不是试盘)
-        if current_sell_seq >= total_buys and not is_tiny_sell and total_buys > 0:
-            logger.warning(f"🚨 [策略触发] 第 {current_sell_seq}/{total_buys} 次卖出 (比例{sell_ratio:.1%}) -> 触发尾单清仓！")
-            is_force_clear = True
-            reason_msg = f"(第 {current_sell_seq}/{total_buys} 次 - 尾单清仓)"
-            
-        # 逻辑 B: 兜底清仓 (次数实在太多了，哪怕是试盘也别陪玩了，由 +2 控制宽限度)
-        elif current_sell_seq >= total_buys + 2 and total_buys > 0:
-            logger.warning(f"🚨 [策略触发] 卖出次数过多 ({current_sell_seq} > {total_buys}+2) -> 触发强制止损清仓！")
-            is_force_clear = True
-            reason_msg = f"(第 {current_sell_seq} 次 - 超限清仓)"
-            
-        # 逻辑 C: 试盘豁免 (虽然次数到了，但是卖得很少，那就陪跑，不清仓)
-        elif current_sell_seq >= total_buys and is_tiny_sell:
-            logger.info(f"🛡️ [策略豁免] 虽次数已满，但大哥仅卖出 {sell_ratio:.1%} (试盘) -> 仅跟随，不清仓")
-            reason_msg = f"(第 {current_sell_seq} 次 - 试盘跟随)"
+        # 只有当还没有触发清仓时，才去检查回合制逻辑
+        if not is_force_clear:
+            # 逻辑 B1: 正常清仓 (次数到了，且不是试盘)
+            if current_sell_seq >= total_buys and not is_tiny_sell and total_buys > 0:
+                logger.warning(f"🚨 [策略触发] 第 {current_sell_seq}/{total_buys} 次卖出 (比例{sell_ratio:.1%}) -> 触发尾单清仓！")
+                is_force_clear = True
+                reason_msg = f"(第 {current_sell_seq}/{total_buys} 次 - 尾单清仓)"
+                
+            # 逻辑 B2: 兜底清仓
+            elif current_sell_seq >= total_buys + 2 and total_buys > 0:
+                logger.warning(f"🚨 [策略触发] 卖出次数过多 ({current_sell_seq} > {total_buys}+2) -> 触发强制止损清仓！")
+                is_force_clear = True
+                reason_msg = f"(第 {current_sell_seq} 次 - 超限清仓)"
+                
+            # 逻辑 B3: 试盘豁免
+            elif current_sell_seq >= total_buys and is_tiny_sell:
+                logger.info(f"🛡️ [策略豁免] 虽次数已满，但大哥仅卖出 {sell_ratio:.1%} (试盘) -> 仅跟随，不清仓")
+                reason_msg = f"(第 {current_sell_seq} 次 - 试盘跟随)"
 
         # 4. 计算最终卖出数量
         my_holdings = self.portfolio[token_mint]['my_balance']
         amount_to_sell = 0
 
         if is_force_clear:
-            # 强制清仓模式
+            # 强制清仓模式 (整数操作，无浮点误差)
             amount_to_sell = my_holdings
-            sell_ratio = 1.0 # 强制修正为 100%
+            sell_ratio = 1.0 
         else:
             # 正常比例跟单模式 (含试盘跟随)
             amount_to_sell = int(my_holdings * sell_ratio)
