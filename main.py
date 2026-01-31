@@ -10,7 +10,7 @@ import argparse
 import asyncio
 import os
 
-from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY
+from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST
 from core.portfolio import PortfolioManager
 from services.risk_control import check_token_liquidity, check_is_honeypot
 from services.solana.monitor import start_monitor, parse_tx, fetch_transaction_details
@@ -27,6 +27,15 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
     token = trade['token_address']
 
     if trade['action'] == "BUY":
+        # --- 🔥🔥🔥 新增：大哥买入金额过滤 (试盘过滤) 🔥🔥🔥 ---
+        # 获取这笔交易大哥花费的 SOL
+        smart_money_cost = trade.get('sol_spent', 0)
+        
+        if smart_money_cost < MIN_SMART_MONEY_COST:
+            logger.warning(f"📉 [过滤] 大哥买入金额过小: {smart_money_cost:.4f} SOL < {MIN_SMART_MONEY_COST} SOL，判断为试盘，忽略跟单")
+            return
+        # -----------------------------------------------------------
+
         # 1. 基础风控 (貔貅检测等)
         is_safe, liq, fdv = await check_token_liquidity(session, token)
 
