@@ -12,7 +12,7 @@ import os
 
 from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_LIQUIDITY_USD, MIN_FDV, MAX_FDV
 from core.portfolio import PortfolioManager
-from services.risk_control import check_token_liquidity
+from services.risk_control import check_token_liquidity, check_is_honeypot
 from services.solana.monitor import start_monitor, parse_tx, fetch_transaction_details
 from services.solana.trader import SolanaTrader
 from utils.logger import logger
@@ -28,11 +28,11 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
     if trade['action'] == "BUY":
         # 1. 风控
         is_safe, liq, fdv = await check_token_liquidity(session, token)
-        is_honeypot = await check_is_honeypot(session, mint)
         if not is_safe:
             logger.warning(f"⚠️ 无法获取数据: {token}")
             return
 
+        is_honeypot = await check_is_honeypot(session, token)
         if not is_honeypot:
             # 为FALSE的话说明不安全
             logger.warning(f"⚠️ 该代币不安全: {token}")
