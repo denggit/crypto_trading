@@ -28,17 +28,17 @@ HTTP_ENDPOINT = f"https://api.helius.xyz/v0/transactions/?api-key={API_KEY}"
 RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={API_KEY}"
 BOT_NAME = os.getenv("BOT_NAME", "NONAME")
 
-# --- 策略配置 ---
-COPY_AMOUNT_SOL = 0.1
-SLIPPAGE_BUY = 1000
-SLIPPAGE_SELL = 2000
-TAKE_PROFIT_ROI = 10.0
+# --- 策略配置(从env获取，方便根据不同风格来配置) ---
+COPY_AMOUNT_SOL = os.getenv("COPY_AMOUNT_SOL", 0.1)
+SLIPPAGE_BUY = os.getenv("SLIPPAGE_BUY", 1000)
+SLIPPAGE_SELL = os.getenv("SLIPPAGE_SELL", 2000)
+TAKE_PROFIT_ROI = os.getenv("TAKE_PROFIT_ROI", 10.0)
 
 # --- 风控配置 (跟单模式 - 激进版) ---
-MIN_LIQUIDITY_USD = 3000   # 原来是 20000 -> 改为 3000
-MAX_FDV = 5000000          # 保持不变
-MIN_FDV = 0                # 原来是 200000 -> 改为 0 (只要有池子就跟)
-MIN_SMART_MONEY_COST = 1.0 # 设定门槛：少于 1.0 SOL 视为试盘/杂音，不跟
+MIN_LIQUIDITY_USD = int(os.getenv("MIN_LIQUIDITY_USD", 3000))           # 池子 > 3000U
+MAX_FDV = int(os.getenv("MAX_FDV", 5000000))                            # 市值 < 500万 (找早期项目)
+MIN_FDV = int(os.getenv("MIN_FDV", 0))                                  # 市值 > 0 (不设下限)
+MIN_SMART_MONEY_COST = float(os.getenv("MIN_SMART_MONEY_COST", 1.0))    # 大哥买入至少 1 SOL
 
 # --- 邮箱配置 ---
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
