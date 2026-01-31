@@ -11,7 +11,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from config.settings import EMAIL_SENDER, EMAIL_RECEIVER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT
+from config.settings import EMAIL_SENDER, EMAIL_RECEIVER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT, BOT_NAME
 
 
 async def send_email_async(subject, content, attachment_path=None):
@@ -28,44 +28,36 @@ async def send_email_async(subject, content, attachment_path=None):
         print(f"❌ 邮件发送后台报错: {e}")
 
 
-def _send_email_sync(subject, content, attachment_path):
-    """ 同步发送逻辑 (由 send_email_async 调用) """
-    if not EMAIL_SENDER or not EMAIL_PASSWORD:
-        return
-
+def _send_email_sync(subject, content, attachment_path=None):
+    """ 同步发送邮件逻辑 """
     try:
-        # 1. 创建复合邮件对象
         msg = MIMEMultipart()
-        msg['From'] = EMAIL_SENDER
-        msg['To'] = EMAIL_RECEIVER  # 发给自己
-        msg['Subject'] = subject
+        
+        # 🔥 2. 修改这里：自动给标题加上机器人前缀
+        # 效果：[激进号] 📊 [日报] 资产与交易总结
+        full_subject = f"[{BOT_NAME}] {subject}"
+        
+        msg["Subject"] = full_subject
+        msg["From"] = EMAIL_SENDER
+        msg["To"] = EMAIL_RECEIVER
 
-        # 2. 添加正文
-        msg.attach(MIMEText(content, 'plain', 'utf-8'))
+        # 正文
+        msg.attach(MIMEText(content, "plain", "utf-8"))
 
-        # 3. 添加附件 (如果有，且文件存在)
+        # 附件
         if attachment_path and os.path.exists(attachment_path):
-            filename = os.path.basename(attachment_path)
-            with open(attachment_path, "rb") as attachment:
-                # 构造附件对象
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(attachment.read())
+            with open(attachment_path, "rb") as f:
+                part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
+                part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment_path)}"'
+                msg.attach(part)
 
-            # 编码并添加头信息
-            encoders.encode_base64(part)
-            part.add_header(
-                "Content-Disposition",
-                f"attachment; filename= {filename}",
-            )
-            msg.attach(part)
-            print(f"📎 已添加附件: {filename}")
-
-        # 4. 连接服务器发送
-        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-
+        # 连接 SMTP 服务器发送
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.send_message(msg)
+        
+        logger.info(f"📧 邮件发送成功: {full_subject}")
+        return True
     except Exception as e:
-        print(f"❌ 邮件发送失败: {e}")
-        raise e
+        logger.error(f"❌ 邮件发送失败: {e}")
+        return False
