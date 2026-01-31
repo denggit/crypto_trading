@@ -22,6 +22,7 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WSS_ENDPOINT = f"wss://mainnet.helius-rpc.com/?api-key={API_KEY}"
 HTTP_ENDPOINT = f"https://api.helius.xyz/v0/transactions/?api-key={API_KEY}"
 RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={API_KEY}"
+BOT_NAME = os.getenv("BOT_NAME", "NONAME")
 
 # --- 策略配置 ---
 COPY_AMOUNT_SOL = 0.1
