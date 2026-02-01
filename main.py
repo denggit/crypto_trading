@@ -22,23 +22,36 @@ from utils.logger import logger
 
 
 async def process_tx_task(session, signature, pm: PortfolioManager):
+    """
+    处理交易任务
+    
+    Args:
+        session: aiohttp会话
+        signature: 交易签名
+        pm: PortfolioManager实例
+    """
     try:
+        logger.debug(f"🔍 开始处理交易: {signature[:16]}...")
         tx_detail = await fetch_transaction_details(session, signature)
         # 如果获取失败，直接返回
-        if not tx_detail: return
+        if not tx_detail:
+            logger.warning(f"⚠️ 无法获取交易详情: {signature[:16]}... (可能交易还未被索引)")
+            return
 
         trade = parse_tx(tx_detail)
         if not trade or not trade['token_address']:
+            logger.debug(f"⚠️ 交易解析失败或非代币交易: {signature[:16]}... (可能是普通转账或其他操作)")
             return
 
         token = trade['token_address']
+        action = trade.get('action', 'UNKNOWN')
+        logger.debug(f"📊 解析到交易: {action} | 代币: {token[:16]}...")
 
         if trade['action'] == "BUY":
             # --- 1. 大哥试盘过滤 ---
             smart_money_cost = trade.get('sol_spent', 0)
             if smart_money_cost < MIN_SMART_MONEY_COST:
-                # 调试日志，平时可关
-                # logger.warning(f"📉 [过滤] {token} 买入金额过小: {smart_money_cost:.4f} SOL")
+                logger.debug(f"📉 [过滤] {token[:16]}... 买入金额过小: {smart_money_cost:.4f} SOL < {MIN_SMART_MONEY_COST} SOL")
                 return
 
             # --- 2. 基础风控 ---
@@ -74,8 +87,7 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
             # 【熔断 1】金额风控：防止归零风险
             # 逻辑：(已花掉的钱 + 这次要花的钱) 是否超过 MAX_POSITION_SOL？
             if current_cost + COPY_AMOUNT_SOL > MAX_POSITION_SOL:
-                # 只有当你想看日志时才打开，避免刷屏
-                # logger.warning(f"🛑 [金额熔断] {token} 总投入将超限 ({current_cost:.2f} + {COPY_AMOUNT_SOL} > {MAX_POSITION_SOL})")
+                logger.warning(f"🛑 [金额熔断] {token[:16]}... 总投入将超限: {current_cost:.2f} + {COPY_AMOUNT_SOL:.2f} > {MAX_POSITION_SOL:.2f} SOL")
                 return
 
             # 【熔断 2】频次风控：防止高频刷单/技术滥用
@@ -101,13 +113,16 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                 # 双重检查（防止并发）
                 current_cost_check = pm.get_position_cost(token)
                 if current_cost_check + COPY_AMOUNT_SOL > MAX_POSITION_SOL:
+                    logger.warning(f"🛑 [双重检查失败] {token} 金额熔断: 当前成本 {current_cost_check:.2f} + 本次 {COPY_AMOUNT_SOL:.2f} > 上限 {MAX_POSITION_SOL:.2f} SOL")
                     return
                 
                 buy_times_check = pm.get_buy_counts(token)
                 if buy_times_check >= MAX_BUY_COUNTS_HARD_LIMIT:
+                    logger.warning(f"🛑 [双重检查失败] {token} 频次熔断: 买入次数 {buy_times_check} >= 上限 {MAX_BUY_COUNTS_HARD_LIMIT}")
                     return
 
                 amount_in = int(COPY_AMOUNT_SOL * 10 ** 9)
+                logger.info(f"💰 开始执行买入: {token} | 金额: {COPY_AMOUNT_SOL:.4f} SOL ({amount_in} lamports)")
 
                 # 🔥🔥 核心修复：填入真正的参数，而不是 ... 🔥🔥
                 success, est_out = await pm.trader.execute_swap(
@@ -122,7 +137,7 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                     # 先记录买入次数，判断是否为第一次买入
                     buy_times_before = pm.get_buy_counts(token)
                     pm.add_position(token, est_out, COPY_AMOUNT_SOL)
-                    logger.info(f"✅ 跟单成功: {token} | 仓位已记录")
+                    logger.info(f"✅ 跟单成功: {token} | 预计获得: {est_out} | 仓位已记录")
                     
                     # 📧 只有第一次买入时才发送邮件通知
                     if buy_times_before == 0:
@@ -134,7 +149,7 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                                 logger.error(f"⚠️ 邮件发送失败: {e}")
                         asyncio.create_task(safe_send_email())
                 else:
-                    logger.error(f"❌ 跟单失败: {token} (Swap执行返回False)")
+                    logger.error(f"❌ 跟单失败: {token} | Swap执行返回False，请查看上方详细错误日志")
 
         elif trade['action'] == "SELL":
             # 🔥 修复：添加锁保护，防止并发卖出导致的数据不一致

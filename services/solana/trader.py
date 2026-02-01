@@ -7,6 +7,7 @@
 import base64
 import os
 import socket
+import traceback
 
 import aiohttp
 import httpx  # 🔥 新增依赖
@@ -93,6 +94,19 @@ class SolanaTrader:
         return os.environ.get("HTTP_PROXY")
 
     async def get_quote(self, session, input_mint, output_mint, amount, slippage_bps=50):
+        """
+        获取交易报价
+        
+        Args:
+            session: aiohttp会话
+            input_mint: 输入代币地址
+            output_mint: 输出代币地址
+            amount: 输入数量（lamports）
+            slippage_bps: 滑点（basis points）
+            
+        Returns:
+            quote响应数据，失败返回None
+        """
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
@@ -111,14 +125,29 @@ class SolanaTrader:
             # 这里的 session 依然会复用之前的代理/NoSSL设置，非常完美
             async with session.get(self.JUP_QUOTE_API, params=params, headers=headers) as response:
                 if response.status != 200:
-                    logger.error(f"询价失败 [{response.status}]: {await response.text()}")
+                    error_text = await response.text()
+                    logger.error(f"❌ 询价API失败 [{response.status}]: {error_text[:500]}")
+                    logger.error(f"   输入: {input_mint[:16]}... | 输出: {output_mint[:16]}... | 数量: {amount}")
                     return None
-                return await response.json()
+                quote_data = await response.json()
+                logger.debug(f"✅ 询价API成功 | 输出数量: {quote_data.get('outAmount', 'N/A')}")
+                return quote_data
         except Exception as e:
-            logger.error(f"询价网络异常: {e}")
+            logger.error(f"❌ 询价网络异常: {e}")
+            logger.error(f"   输入: {input_mint[:16]}... | 输出: {output_mint[:16]}... | 数量: {amount}")
             return None
 
     async def get_swap_tx(self, session, quote_response):
+        """
+        构建交易数据
+        
+        Args:
+            session: aiohttp会话
+            quote_response: 询价响应数据
+            
+        Returns:
+            swap交易数据，失败返回None
+        """
         payload = {
             "quoteResponse": quote_response,
             "userPublicKey": str(self.payer.pubkey()),
@@ -134,15 +163,31 @@ class SolanaTrader:
         try:
             async with session.post(self.JUP_SWAP_API, json=payload, headers=headers) as response:
                 if response.status != 200:
-                    logger.error(f"构建交易失败 [{response.status}]: {await response.text()}")
+                    error_text = await response.text()
+                    logger.error(f"❌ 构建交易API失败 [{response.status}]: {error_text[:500]}")
+                    logger.error(f"   用户钱包: {str(self.payer.pubkey())[:16]}...")
                     return None
-                return await response.json()
+                swap_data = await response.json()
+                logger.debug(f"✅ 构建交易API成功")
+                return swap_data
         except Exception as e:
-            logger.error(f"Swap API 异常: {e}")
+            logger.error(f"❌ Swap API网络异常: {e}")
+            logger.error(f"   用户钱包: {str(self.payer.pubkey())[:16]}...")
             return None
 
     async def execute_swap(self, input_mint, output_mint, amount_lamports, slippage_bps=100):
-        """ 执行交易 """
+        """
+        执行交易
+        
+        Args:
+            input_mint: 输入代币地址
+            output_mint: 输出代币地址
+            amount_lamports: 输入数量（lamports）
+            slippage_bps: 滑点（basis points）
+            
+        Returns:
+            (success: bool, out_amount: int): 交易是否成功，预计输出数量
+        """
         # 🔥🔥 核武器：强制 IPv4 + NoSSL 连接器 🔥🔥
         connector = aiohttp.TCPConnector(
             family=socket.AF_INET,
@@ -151,30 +196,45 @@ class SolanaTrader:
         )
         # trust_env=False 防止干扰，完全手动控制
         async with aiohttp.ClientSession(connector=connector, trust_env=False) as session:
+            # 步骤1: 询价
+            logger.info(f"📊 [步骤1/3] 正在询价: {input_mint[:8]}... -> {output_mint[:8]}...")
             quote = await self.get_quote(session, input_mint, output_mint, amount_lamports, slippage_bps)
-            if not quote: return False, 0
+            if not quote:
+                logger.error(f"❌ [步骤1失败] 询价失败，无法获取报价")
+                return False, 0
 
             out_amount_est = int(quote['outAmount'])
-            swap_res = await self.get_swap_tx(session, quote)
-            if not swap_res: return False, 0
+            logger.info(f"✅ [步骤1完成] 询价成功 | 预计获得: {out_amount_est}")
 
+            # 步骤2: 构建交易
+            logger.info(f"🔨 [步骤2/3] 正在构建交易...")
+            swap_res = await self.get_swap_tx(session, quote)
+            if not swap_res:
+                logger.error(f"❌ [步骤2失败] 构建交易失败，无法获取交易数据")
+                return False, 0
+
+            logger.info(f"✅ [步骤2完成] 交易构建成功")
+
+            # 步骤3: 签名并发送交易
             try:
+                logger.info(f"✍️ [步骤3/3] 正在签名交易...")
                 tx_bytes = base64.b64decode(swap_res['swapTransaction'])
                 transaction = VersionedTransaction.from_bytes(tx_bytes)
                 message = transaction.message
                 signature = self.payer.sign_message(to_bytes_versioned(message))
                 signed_tx = VersionedTransaction.populate(message, [signature])
 
-                logger.info("🚀 发送交易上链...")
+                logger.info("🚀 [步骤3] 发送交易上链...")
                 opts = TxOpts(skip_preflight=True, max_retries=3)
                 result = await self.rpc_client.send_transaction(signed_tx, opts=opts)
 
                 tx_hash = str(result.value)
-                logger.info(f"✅ 交易成功! Hash: https://solscan.io/tx/{tx_hash}")
+                logger.info(f"✅ [步骤3完成] 交易成功上链! Hash: https://solscan.io/tx/{tx_hash}")
                 return True, out_amount_est
 
             except Exception as e:
-                logger.error(f"❌ 交易执行异常: {e}")
+                logger.error(f"❌ [步骤3失败] 交易执行异常: {e}")
+                logger.error(traceback.format_exc())
                 return False, 0
 
     async def close_token_account(self, token_mint_str):
