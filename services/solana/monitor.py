@@ -182,69 +182,56 @@ async def start_monitor(process_callback, pm):
                         
                         asyncio.create_task(safe_process())
 
-                    # 🔥 关键修复：WebSocket连接稳定性监控
+                    # 🔥 关键修复：WebSocket连接状态监控（仅用于日志，不用于判断断开）
                     # WebSocket本身有ping_interval=30, ping_timeout=60，会自动检测连接状态
+                    # 注意：websockets库的ping/pong在底层自动处理，不会触发应用层的ws.recv()
+                    # 如果连接断开，websockets库会在ws.recv()时抛出异常
                     last_message_time = asyncio.get_event_loop().time()
                     STATUS_LOG_INTERVAL = 1800  # 每30分钟记录一次状态（长时间没消息是正常的）
                     last_status_log_time = asyncio.get_event_loop().time()
-                    ws_connection_alive = True  # WebSocket连接状态标志
                     
-                    # 🔥 新增：WebSocket连接监控任务（确保连接不断）
-                    async def websocket_connection_monitor():
+                    # 🔥 新增：WebSocket状态监控任务（仅用于日志，不用于判断断开）
+                    async def websocket_status_monitor():
                         """
-                        监控WebSocket连接状态，确保连接稳定
-                        - 检测连接是否真的在工作（通过ping/pong）
-                        - 如果检测到连接异常，主动触发重连
+                        监控WebSocket连接状态（仅用于日志记录）
+                        - 依赖websockets库的ping/pong机制检测连接状态
+                        - 如果连接断开，websockets库会在ws.recv()时抛出异常
+                        - 长时间没有交易消息是正常的，不应该判断为断开
                         """
-                        nonlocal last_message_time, last_status_log_time, ws_connection_alive
-                        CONNECTION_CHECK_INTERVAL = 60  # 每1分钟检查一次连接状态
-                        MAX_SILENT_TIME = 300  # 5分钟没有任何消息（包括ping/pong）就认为连接异常
+                        nonlocal last_message_time, last_status_log_time
                         
-                        while ws_connection_alive:
-                            await asyncio.sleep(CONNECTION_CHECK_INTERVAL)
+                        while True:
+                            await asyncio.sleep(STATUS_LOG_INTERVAL)  # 每30分钟记录一次
                             current_time = asyncio.get_event_loop().time()
                             time_since_last_msg = current_time - last_message_time
                             
-                            # 检查连接状态
-                            # 注意：WebSocket的ping/pong是自动的，如果连接正常，ping/pong会更新last_message_time
-                            # 但如果超过5分钟没有任何消息（包括ping/pong），可能连接已经静默断开
-                            if time_since_last_msg > MAX_SILENT_TIME:
-                                logger.error(f"💀 WebSocket连接异常！已 {time_since_last_msg:.1f} 秒未收到任何消息（包括ping/pong），连接可能已断开")
-                                logger.error("🔄 主动触发重连...")
-                                ws_connection_alive = False
-                                # 尝试关闭连接以触发重连
-                                try:
-                                    await ws.close()
-                                except:
-                                    pass
-                                break
-                            
-                            # 定期记录连接状态（长时间没交易消息是正常的，但ping/pong应该正常）
-                            if current_time - last_status_log_time >= STATUS_LOG_INTERVAL:
-                                hours = time_since_last_msg / 3600
-                                if hours >= 1:
-                                    logger.info(f"💓 WebSocket连接正常 | 订阅ID: {subscription_id} | 已 {hours:.1f} 小时未收到交易（正常，大哥可能还没交易）")
-                                else:
-                                    logger.info(f"💓 WebSocket连接正常 | 订阅ID: {subscription_id} | 最后消息: {time_since_last_msg/60:.1f} 分钟前")
-                                last_status_log_time = current_time
+                            # 只记录状态，不判断断开（长时间没交易消息是正常的）
+                            hours = time_since_last_msg / 3600
+                            if hours >= 1:
+                                logger.info(f"💓 WebSocket连接正常 | 订阅ID: {subscription_id} | 已 {hours:.1f} 小时未收到交易（正常，大哥可能还没交易）")
+                            else:
+                                logger.info(f"💓 WebSocket连接正常 | 订阅ID: {subscription_id} | 最后交易: {time_since_last_msg/60:.1f} 分钟前")
+                            last_status_log_time = current_time
                     
-                    # 启动WebSocket连接监控任务
-                    connection_monitor_task = asyncio.create_task(websocket_connection_monitor())
+                    # 启动状态监控任务
+                    status_monitor_task = asyncio.create_task(websocket_status_monitor())
                     
                     
                     # 主循环：处理所有消息
                     # 🔥 关键修复：依赖WebSocket的ping/pong机制检测连接状态
                     # websockets库已设置ping_interval=30, ping_timeout=60，会自动检测连接断开
+                    # 如果连接断开，websockets库会在ws.recv()时抛出ConnectionClosed异常
+                    # 如果连接正常但没消息，这里会一直等待（这是正常的）
+                    # 注意：websockets库的ping/pong在底层自动处理，不会触发应用层的ws.recv()
                     try:
-                        while ws_connection_alive:
+                        while True:
                             # 直接接收消息，不设置超时
                             # 如果连接断开，websockets库会自动抛出ConnectionClosed异常
                             # 如果连接正常但没消息，这里会一直等待（这是正常的）
-                            # 注意：ping/pong消息也会触发这里，更新last_message_time
                             msg = await ws.recv()
                             data = json.loads(msg)
                             
-                            # 更新最后收到消息的时间（包括ping/pong）
+                            # 更新最后收到消息的时间（仅应用层消息，ping/pong在底层处理）
                             current_time = asyncio.get_event_loop().time()
                             last_message_time = current_time
 
@@ -274,11 +261,10 @@ async def start_monitor(process_callback, pm):
                                 if msg_type not in ["ping", "pong"]:  # 忽略心跳消息
                                     logger.debug(f"📨 收到其他消息: {msg_type}, 内容: {str(data)[:200]}")
                     finally:
-                        # 清理：取消连接监控任务
-                        ws_connection_alive = False
-                        connection_monitor_task.cancel()
+                        # 清理：取消状态监控任务
+                        status_monitor_task.cancel()
                         try:
-                            await connection_monitor_task
+                            await status_monitor_task
                         except asyncio.CancelledError:
                             pass
 
