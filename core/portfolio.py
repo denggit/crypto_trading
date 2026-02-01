@@ -152,6 +152,95 @@ class PortfolioManager:
     def get_sell_counts(self, token_mint):
         return self.sell_counts_cache.get(token_mint, 0)
 
+    def _generate_trade_history_table(self, token_mint):
+        """
+        生成指定代币的交易历史表格
+        :param token_mint: 代币地址
+        :return: 交易历史表格文本
+        """
+        # 筛选该代币的所有交易记录
+        token_trades = [r for r in self.trade_history if r.get('token') == token_mint]
+        if not token_trades:
+            return "暂无交易记录"
+        
+        # 按时间排序
+        token_trades.sort(key=lambda x: x.get('time', ''))
+        
+        # 计算累计持仓和成本
+        current_holding = 0
+        total_cost = 0.0
+        table_lines = []
+        table_lines.append("=" * 100)
+        table_lines.append(f"{'时间':<20} {'交易方式':<12} {'数量':<20} {'成本(SOL)':<15} {'盈利情况':<20} {'剩余仓位':<15}")
+        table_lines.append("=" * 100)
+        
+        for record in token_trades:
+            time_str = record.get('time', '')
+            action = record.get('action', '')
+            amount = record.get('amount', 0)
+            value_sol = record.get('value_sol', 0)
+            
+            # 简化代币地址显示
+            token_short = f"{token_mint[:6]}...{token_mint[-4:]}"
+            
+            # 交易方式
+            if action == 'BUY':
+                trade_type = "买入"
+                current_holding += amount
+                total_cost += value_sol
+                profit_info = "-"
+                remaining = current_holding
+            elif 'SELL' in action:
+                trade_type = "卖出"
+                if current_holding > 0:
+                    avg_cost = total_cost / current_holding if current_holding > 0 else 0
+                    cost_of_sell = avg_cost * amount
+                    profit = value_sol - cost_of_sell
+                    profit_pct = (profit / cost_of_sell * 100) if cost_of_sell > 0 else 0
+                    profit_info = f"{profit:+.4f} SOL ({profit_pct:+.1f}%)"
+                    current_holding -= amount
+                    total_cost = max(0, total_cost - cost_of_sell)
+                else:
+                    profit_info = "N/A"
+                    current_holding = 0
+                remaining = current_holding
+            else:
+                trade_type = action
+                profit_info = "-"
+                remaining = current_holding
+            
+            # 格式化数量显示
+            if amount >= 1e9:
+                amount_str = f"{amount / 1e9:.4f}"
+            elif amount >= 1e6:
+                amount_str = f"{amount / 1e6:.2f}M"
+            else:
+                amount_str = f"{amount:.0f}"
+            
+            # 格式化剩余仓位
+            if remaining >= 1e9:
+                remaining_str = f"{remaining / 1e9:.4f}"
+            elif remaining >= 1e6:
+                remaining_str = f"{remaining / 1e6:.2f}M"
+            else:
+                remaining_str = f"{remaining:.0f}"
+            
+            table_lines.append(
+                f"{time_str:<20} {trade_type:<12} {amount_str:<20} {value_sol:<15.4f} {profit_info:<20} {remaining_str:<15}"
+            )
+        
+        table_lines.append("=" * 100)
+        
+        # 添加总结信息
+        if current_holding > 0:
+            table_lines.append(f"\n当前剩余仓位: {current_holding}")
+            table_lines.append(f"累计成本: {total_cost:.4f} SOL")
+        else:
+            table_lines.append(f"\n已全部清仓")
+            table_lines.append(f"累计成本: {total_cost:.4f} SOL")
+        
+        return "\n".join(table_lines)
+
     async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
         # 1. 检查持仓
         if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
@@ -266,16 +355,6 @@ class PortfolioManager:
             self._save_portfolio()
             self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
 
-            # 邮件通知
-            msg = f"检测到聪明钱卖出，已跟随卖出。\n\n代币: {token_mint}\n数量: {amount_to_sell}\n比例: {sell_ratio:.1%}\n说明: {reason_msg if reason_msg else '比例跟随'}"
-            # 🔥 修复：添加异常处理，防止邮件发送失败影响主流程
-            async def safe_send_email():
-                try:
-                    await send_email_async(f"📉 跟随卖出成功: {token_mint[:6]}...", msg)
-                except Exception as e:
-                    logger.error(f"⚠️ 邮件发送失败: {e}")
-            asyncio.create_task(safe_send_email())
-
     async def monitor_sync_positions(self):
         logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
         async with aiohttp.ClientSession(trust_env=False) as session:
@@ -358,7 +437,7 @@ class PortfolioManager:
                                 # 如果剩下的太少(是粉尘)，干脆全卖了
                                 # 🔥 修复：使用配置的 TAKE_PROFIT_SELL_PCT 而不是硬编码 0.2
                                 remaining_ratio = 1 - TAKE_PROFIT_SELL_PCT
-                                est_val_remaining = (curr_val * remaining_ratio) / 10 ** 9
+                                est_val_remaining = (curr_val_lamports * remaining_ratio) / 10 ** 9
                                 is_clear_all = False
 
                                 if est_val_remaining < 0.01:  # 剩下的不值钱，全清
@@ -379,12 +458,16 @@ class PortfolioManager:
                                 )
 
                                 if success:
+                                    # 先保存剩余仓位（在删除之前）
+                                    remaining_balance = self.portfolio[token_mint]['my_balance'] - amount_to_sell
+                                    
                                     self.portfolio[token_mint]['my_balance'] -= amount_to_sell
 
                                     # 如果是全清，才删除数据和关账户
                                     if is_clear_all or self.portfolio[token_mint]['my_balance'] <= 0:
                                         if token_mint in self.portfolio:
                                             del self.portfolio[token_mint]
+                                        remaining_balance = 0
                                         # 🔥 修复：添加异常处理
                                         async def safe_close_account():
                                             try:
@@ -393,7 +476,7 @@ class PortfolioManager:
                                                 logger.error(f"⚠️ 关闭账户失败: {e}")
                                         asyncio.create_task(safe_close_account())
                                     else:
-                                        # 如果是留种，仅仅把成本归零（因为已经回本了），让它变成“零成本持仓”
+                                        # 如果是留种，仅仅把成本归零（因为已经回本了），让它变成"零成本持仓"
                                         # 这样下次就不会再基于旧成本计算 ROI 了，或者你可以选择不更新成本，继续监控
                                         # 这里简单处理：更新余额即可，下次循环如果 ROI 还在涨，还会继续卖 80% 的 80%...
                                         pass
@@ -401,12 +484,13 @@ class PortfolioManager:
                                     self._save_portfolio()
                                     self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out)
 
-                                    # 发邮件
-                                    msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi * 100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out / 10 ** 9:.4f}"
+                                    # 发邮件（包含交易历史表格）
+                                    trade_table = self._generate_trade_history_table(token_mint)
+                                    msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi * 100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out / 10 ** 9:.4f}\n剩余仓位: {remaining_balance}\n\n【交易历史记录】\n{trade_table}"
                                     # 🔥 修复：添加异常处理
                                     async def safe_send_email():
                                         try:
-                                            await send_email_async(f"💰 止盈通知: {token_mint[:6]}...", msg)
+                                            await send_email_async(f"💰 止盈通知: {token_mint}", msg)
                                         except Exception as e:
                                             logger.error(f"⚠️ 邮件发送失败: {e}")
                                     asyncio.create_task(safe_send_email())
@@ -445,12 +529,16 @@ class PortfolioManager:
             asyncio.create_task(safe_close_account())
             self._save_portfolio()
             self._record_history("SELL_FORCE", token_mint, amount, est_sol_out)
+            
+            # 生成交易历史表格
+            trade_table = self._generate_trade_history_table(token_mint)
+            
             if roi == -0.99:
-                subject = f"🛡️ 防断网风控: {token_mint[:6]}..."
-                msg = f"检测到聪明钱已清仓，已补救卖出。\n\n代币: {token_mint}"
+                subject = f"🛡️ 防断网风控: {token_mint}"
+                msg = f"检测到聪明钱已清仓，已补救卖出。\n\n代币: {token_mint}\n卖出数量: {amount}\n到手SOL: {est_sol_out / 10 ** 9:.4f}\n\n【交易历史记录】\n{trade_table}"
             else:
-                subject = f"🚀 暴富止盈: {token_mint[:6]}..."
-                msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出"
+                subject = f"🚀 暴富止盈: {token_mint}"
+                msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出\n到手SOL: {est_sol_out / 10 ** 9:.4f}\n\n【交易历史记录】\n{trade_table}"
             # 🔥 修复：添加异常处理
             async def safe_send_email():
                 try:

@@ -14,6 +14,7 @@ import traceback  # 🔥 引入错误堆栈打印
 from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, \
     MIN_FDV, MAX_BUY_TIME
 from core.portfolio import PortfolioManager
+from services.notification import send_email_async
 from services.risk_control import check_token_liquidity, check_is_safe_token
 from services.solana.monitor import start_monitor, parse_tx, fetch_transaction_details
 from services.solana.trader import SolanaTrader
@@ -99,8 +100,20 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
 
                 if success:
                     # 🔥 修复：cost_sol 应该是 SOL 数量，不是 lamports
+                    # 先记录买入次数，判断是否为第一次买入
+                    buy_times_before = pm.get_buy_counts(token)
                     pm.add_position(token, est_out, COPY_AMOUNT_SOL)
                     logger.info(f"✅ 跟单成功: {token} | 仓位已记录")
+                    
+                    # 📧 只有第一次买入时才发送邮件通知
+                    if buy_times_before == 0:
+                        msg = f"✅ 首次买入交易成功\n\n代币: {token}\n买入数量: {est_out}\n成本: {COPY_AMOUNT_SOL:.4f} SOL"
+                        async def safe_send_email():
+                            try:
+                                await send_email_async(f"📈 买入通知: {token}", msg)
+                            except Exception as e:
+                                logger.error(f"⚠️ 邮件发送失败: {e}")
+                        asyncio.create_task(safe_send_email())
                 else:
                     logger.error(f"❌ 跟单失败: {token} (Swap执行返回False)")
 
