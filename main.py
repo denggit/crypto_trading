@@ -14,7 +14,7 @@ import traceback  # 🔥 引入错误堆栈打印
 from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, \
     MIN_FDV, MAX_BUY_TIME
 from core.portfolio import PortfolioManager
-from services.risk_control import check_token_liquidity, check_is_honeypot
+from services.risk_control import check_token_liquidity, check_is_safe_token
 from services.solana.monitor import start_monitor, parse_tx, fetch_transaction_details
 from services.solana.trader import SolanaTrader
 from utils.logger import logger
@@ -59,9 +59,10 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                 logger.warning(f"📈 [拦截] 市值过大: {token} (${fdv:,.0f} > ${MAX_FDV:,.0f})")
                 return
 
-            is_honeypot = await check_is_honeypot(session, token)
-            if not is_honeypot:
-                logger.warning(f"🚫 [拦截] 貔貅盘: {token}")
+            # 🔥 修复：函数重命名为 check_is_safe_token，逻辑更清晰
+            is_safe = await check_is_safe_token(session, token)
+            if not is_safe:
+                logger.warning(f"🚫 [拦截] 貔貅盘/高风险代币: {token}")
                 return
 
             # --- 3. 次数与资金限制 ---
@@ -97,13 +98,16 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                 )
 
                 if success:
-                    pm.add_position(token, est_out, amount_in)
+                    # 🔥 修复：cost_sol 应该是 SOL 数量，不是 lamports
+                    pm.add_position(token, est_out, COPY_AMOUNT_SOL)
                     logger.info(f"✅ 跟单成功: {token} | 仓位已记录")
                 else:
                     logger.error(f"❌ 跟单失败: {token} (Swap执行返回False)")
 
         elif trade['action'] == "SELL":
-            await pm.execute_proportional_sell(token, trade['amount'])
+            # 🔥 修复：添加锁保护，防止并发卖出导致的数据不一致
+            async with pm.get_token_lock(token):
+                await pm.execute_proportional_sell(token, trade['amount'])
 
     except Exception as e:
         # 🔥 全局异常捕获：如果哪里再报错，这里会打印出来！

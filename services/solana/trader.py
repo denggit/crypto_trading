@@ -31,35 +31,9 @@ load_dotenv()
 
 class SolanaTrader:
     def __init__(self, rpc_endpoint):
-        # 🔥 核心修复：创建一个不验证 SSL 的 httpx 客户端
-        # trust_env=True 会自动读取系统环境变量里的代理设置
-        self.http_client = httpx.AsyncClient(verify=False, trust_env=True, timeout=30.0)
-
-        # 将这个“不听话”的客户端注入到 Solana Provider 中
-        provider = AsyncHTTPProvider(endpoint=rpc_endpoint, extra_headers={"Content-Type": "application/json"})
-        # 强行覆盖 provider 内部的 session (这是 solana-py 的底层逻辑)
-        # 注意：solana-py 版本不同可能实现不同，但通常 provider.session 就是 httpx client
-        # 如果版本较新，可能需要通过构造函数传递，但目前的库通常不支持直接传 client
-        # 所以我们用这一招：让 Provider 使用我们自定义的 client
-        # (注：为了兼容性，更稳妥的方式是让 httpx 全局不验证，但那样太暴力。
-        # 这里我们利用 AsyncHTTPProvider 的机制，它初始化时会创建 session。
-        # 我们这里重新初始化一个 AsyncClient 并传入 provider)
-
-        # 更稳妥的注入方式：
-        # 直接使用 args 构造 AsyncClient，但 solana 库没暴露 verify 参数。
-        # 所以我们这里做一个 trick：
+        # 🔥 修复：移除未使用的 http_client，直接使用 rpc_client
+        # 注意：httpx 的 SSL 验证已通过全局 patch_httpx_verify() 关闭
         self.rpc_client = AsyncClient(rpc_endpoint, timeout=30)
-        # 替换内部 provider 的 session
-        if hasattr(self.rpc_client._provider, 'session'):
-            # 关闭原有的，换成我们的
-            # (这里不做替换了，风险较大，我们改用环境变量控制 httpx)
-            pass
-
-        # 💡 重新思考：最稳妥的方法其实是直接控制 httpx 的全局行为或者在 main.py 里处理
-        # 但既然要在 trader 里封装，我们用下面这个最稳的写法：
-        # 自定义 Provider 类太复杂，我们直接用 httpx 的环境变量。
-        # 见下方 _hack_httpx_verify()
-        pass
 
         if not PRIVATE_KEY:
             raise ValueError("❌ 未找到私钥，请在 .env 或 config/settings.py 中配置 PRIVATE_KEY")
@@ -75,7 +49,6 @@ class SolanaTrader:
     async def close(self):
         """ 关闭资源 """
         await self.rpc_client.close()
-        await self.http_client.aclose()
 
     async def get_token_balance(self, wallet_pubkey_str, token_mint_str):
         """ 查询指定钱包的代币余额 """

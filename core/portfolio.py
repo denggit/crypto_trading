@@ -88,13 +88,25 @@ class PortfolioManager:
         return self.locks[token_mint]
 
     def _save_portfolio(self):
-        asyncio.get_event_loop().run_in_executor(
-            self.calc_executor, self._write_json_worker, PORTFOLIO_FILE, self.portfolio
+        # 🔥 修复：传递快照而不是引用，避免并发修改导致的数据不一致
+        portfolio_snapshot = dict(self.portfolio)
+        # 🔥 修复：使用 asyncio.get_running_loop() 替代 get_event_loop()，兼容 Python 3.10+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        loop.run_in_executor(
+            self.calc_executor, self._write_json_worker, PORTFOLIO_FILE, portfolio_snapshot
         )
 
     def _save_history(self):
         history_snapshot = list(self.trade_history)
-        asyncio.get_event_loop().run_in_executor(
+        # 🔥 修复：使用 asyncio.get_running_loop() 替代 get_event_loop()，兼容 Python 3.10+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        loop.run_in_executor(
             self.calc_executor, self._write_json_worker, HISTORY_FILE, history_snapshot
         )
 
@@ -224,6 +236,7 @@ class PortfolioManager:
 
         # 5. 执行卖出
         logger.info(f"📉 跟随卖出{reason_msg}: {amount_to_sell} (占持仓 {sell_ratio:.2%})")
+        # 🔥 修复：使用关键字参数，确保参数正确传递
         success, est_sol_out = await self.trader.execute_swap(
             input_mint=token_mint,
             output_mint=self.trader.SOL_MINT,
@@ -242,14 +255,26 @@ class PortfolioManager:
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
                 logger.info(f"🧹 正在尝试回收账户租金...")
                 await asyncio.sleep(2)
-                asyncio.create_task(self.trader.close_token_account(token_mint))
+                # 🔥 修复：添加异常处理，防止任务失败静默
+                async def safe_close_account():
+                    try:
+                        await self.trader.close_token_account(token_mint)
+                    except Exception as e:
+                        logger.error(f"⚠️ 关闭账户失败: {e}")
+                asyncio.create_task(safe_close_account())
 
             self._save_portfolio()
             self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
 
             # 邮件通知
             msg = f"检测到聪明钱卖出，已跟随卖出。\n\n代币: {token_mint}\n数量: {amount_to_sell}\n比例: {sell_ratio:.1%}\n说明: {reason_msg if reason_msg else '比例跟随'}"
-            asyncio.create_task(send_email_async(f"📉 跟随卖出成功: {token_mint[:6]}...", msg))
+            # 🔥 修复：添加异常处理，防止邮件发送失败影响主流程
+            async def safe_send_email():
+                try:
+                    await send_email_async(f"📉 跟随卖出成功: {token_mint[:6]}...", msg)
+                except Exception as e:
+                    logger.error(f"⚠️ 邮件发送失败: {e}")
+            asyncio.create_task(safe_send_email())
 
     async def monitor_sync_positions(self):
         logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
@@ -309,10 +334,12 @@ class PortfolioManager:
                                                             data['my_balance'])
 
                         if quote:
-                            curr_val = int(quote['outAmount'])
-                            cost = data['cost_sol']
-                            # 计算收益率
-                            roi = (curr_val / cost) - 1 if cost > 0 else 0
+                            curr_val_lamports = int(quote['outAmount'])
+                            # 🔥 修复：统一单位，将 lamports 转换为 SOL 数量
+                            curr_val_sol = curr_val_lamports / 10 ** 9
+                            cost_sol = data['cost_sol']
+                            # 计算收益率（统一使用 SOL 单位）
+                            roi = (curr_val_sol / cost_sol) - 1 if cost_sol > 0 else 0
 
                             # 🔥 触发止盈阈值 (比如 1000%)
                             if roi >= TAKE_PROFIT_ROI:
@@ -323,7 +350,9 @@ class PortfolioManager:
                                 amount_to_sell = int(data['my_balance'] * TAKE_PROFIT_SELL_PCT)
 
                                 # 如果剩下的太少(是粉尘)，干脆全卖了
-                                est_val_remaining = (curr_val * 0.2) / 10 ** 9
+                                # 🔥 修复：使用配置的 TAKE_PROFIT_SELL_PCT 而不是硬编码 0.2
+                                remaining_ratio = 1 - TAKE_PROFIT_SELL_PCT
+                                est_val_remaining = (curr_val * remaining_ratio) / 10 ** 9
                                 is_clear_all = False
 
                                 if est_val_remaining < 0.01:  # 剩下的不值钱，全清
@@ -335,8 +364,12 @@ class PortfolioManager:
                                         f"   -> 锁定 {TAKE_PROFIT_SELL_PCT * 100}% 利润，保留 {(1 - TAKE_PROFIT_SELL_PCT) * 100}% 博百倍金狗！")
 
                                 # 执行卖出
+                                # 🔥 修复：使用关键字参数，避免参数顺序错误
                                 success, est_sol_out = await self.trader.execute_swap(
-                                    token_mint, self.trader.SOL_MINT, amount_to_sell, SLIPPAGE_SELL
+                                    input_mint=token_mint,
+                                    output_mint=self.trader.SOL_MINT,
+                                    amount_lamports=amount_to_sell,
+                                    slippage_bps=SLIPPAGE_SELL
                                 )
 
                                 if success:
@@ -346,7 +379,13 @@ class PortfolioManager:
                                     if is_clear_all or self.portfolio[token_mint]['my_balance'] <= 0:
                                         if token_mint in self.portfolio:
                                             del self.portfolio[token_mint]
-                                        asyncio.create_task(self.trader.close_token_account(token_mint))
+                                        # 🔥 修复：添加异常处理
+                                        async def safe_close_account():
+                                            try:
+                                                await self.trader.close_token_account(token_mint)
+                                            except Exception as e:
+                                                logger.error(f"⚠️ 关闭账户失败: {e}")
+                                        asyncio.create_task(safe_close_account())
                                     else:
                                         # 如果是留种，仅仅把成本归零（因为已经回本了），让它变成“零成本持仓”
                                         # 这样下次就不会再基于旧成本计算 ROI 了，或者你可以选择不更新成本，继续监控
@@ -358,7 +397,13 @@ class PortfolioManager:
 
                                     # 发邮件
                                     msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi * 100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out / 10 ** 9:.4f}"
-                                    asyncio.create_task(send_email_async(f"💰 止盈通知: {token_mint[:6]}...", msg))
+                                    # 🔥 修复：添加异常处理
+                                    async def safe_send_email():
+                                        try:
+                                            await send_email_async(f"💰 止盈通知: {token_mint[:6]}...", msg)
+                                        except Exception as e:
+                                            logger.error(f"⚠️ 邮件发送失败: {e}")
+                                    asyncio.create_task(safe_send_email())
 
                                     # 稍微休息一下，防止针对同一个币疯狂触发
                                     await asyncio.sleep(60)
@@ -369,8 +414,12 @@ class PortfolioManager:
                 await asyncio.sleep(10)
 
     async def force_sell_all(self, token_mint, amount, roi):
+        # 🔥 修复：使用关键字参数，确保参数正确传递
         success, est_sol_out = await self.trader.execute_swap(
-            token_mint, self.trader.SOL_MINT, amount, SLIPPAGE_SELL
+            input_mint=token_mint,
+            output_mint=self.trader.SOL_MINT,
+            amount_lamports=amount,
+            slippage_bps=SLIPPAGE_SELL
         )
         if success:
             if token_mint in self.portfolio:
@@ -381,7 +430,13 @@ class PortfolioManager:
 
             logger.info(f"🧹 [强平] 正在尝试回收账户租金...")
             await asyncio.sleep(2)
-            asyncio.create_task(self.trader.close_token_account(token_mint))
+            # 🔥 修复：添加异常处理
+            async def safe_close_account():
+                try:
+                    await self.trader.close_token_account(token_mint)
+                except Exception as e:
+                    logger.error(f"⚠️ 关闭账户失败: {e}")
+            asyncio.create_task(safe_close_account())
             self._save_portfolio()
             self._record_history("SELL_FORCE", token_mint, amount, est_sol_out)
             if roi == -0.99:
@@ -390,7 +445,13 @@ class PortfolioManager:
             else:
                 subject = f"🚀 暴富止盈: {token_mint[:6]}..."
                 msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出"
-            asyncio.create_task(send_email_async(subject, msg))
+            # 🔥 修复：添加异常处理
+            async def safe_send_email():
+                try:
+                    await send_email_async(subject, msg)
+                except Exception as e:
+                    logger.error(f"⚠️ 邮件发送失败: {e}")
+            asyncio.create_task(safe_send_email())
 
     async def schedule_daily_report(self):
         """ 每日日报调度器 (支持自定义时间) """

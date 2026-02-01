@@ -10,10 +10,14 @@ import aiohttp
 from utils.logger import logger
 
 
-async def check_is_honeypot(session, token_mint):
+async def check_is_safe_token(session, token_mint):
     """
-    🔥 核心风控：检测是否为貔貅/蜜罐
+    🔥 核心风控：检测代币是否安全（非貔貅/蜜罐）
     使用 RugCheck API (专门针对 Solana)
+    
+    :param session: aiohttp 会话
+    :param token_mint: 代币地址
+    :return: True 表示安全（可以交易），False 表示危险（貔貅盘/蜜罐）
     """
     if token_mint == "So11111111111111111111111111111111111111112": # WSOL
         return True # 安全

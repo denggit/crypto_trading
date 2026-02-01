@@ -8,6 +8,7 @@
 """
 import asyncio
 import json
+import traceback
 import aiohttp
 import websockets
 from config.settings import WSS_ENDPOINT, TARGET_WALLET, HTTP_ENDPOINT
@@ -126,7 +127,15 @@ async def start_monitor(process_callback, pm):
                             logger.info(f"⚡ 捕获链上动作: {signature[:8]}... (正在解析)")
 
                             # 异步处理，防止阻塞 WebSocket 心跳
-                            asyncio.create_task(process_callback(session, signature, pm))
+                            # 🔥 修复：添加异常处理，防止单个任务崩溃影响整体监控
+                            async def safe_process():
+                                try:
+                                    await process_callback(session, signature, pm)
+                                except Exception as e:
+                                    logger.error(f"💥 处理交易任务异常: {e}")
+                                    logger.error(traceback.format_exc())
+                            
+                            asyncio.create_task(safe_process())
 
             except Exception as e:
                 logger.error(f"❌ WebSocket 断开: {e}, 3秒后重连...")

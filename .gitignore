@@ -1,11 +1,11 @@
 /.env
 /log/
 /data/
-/.env_bota
-/.env_botb
-/.env_botc
 /tools/wallets_ori.txt
 /tools/gmgn.ai.har
 /tools/wallets.txt
 /tools/wallets_trash.txt
 /tools/results/
+/bota.env
+/botb.env
+/botc.env
