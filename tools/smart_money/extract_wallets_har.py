@@ -1,5 +1,5 @@
-import json
 import base64
+import json
 import re
 
 
@@ -28,7 +28,7 @@ def extract_from_json(obj, found_addresses):
 
 def main():
     wallets = set()
-    har_file = 'gmgn.ai.har'  # 请确保文件名正确
+    har_file = 'smart_money/gmgn.ai.har'  # 请确保文件名正确
 
     with open(har_file, 'r', encoding='utf-8') as f:
         har_data = json.load(f)
@@ -66,7 +66,7 @@ def main():
 
     # 排序并保存
     sorted_wallets = sorted(list(wallets))
-    with open('wallets.txt', 'w', encoding='utf-8') as f:
+    with open('smart_money/wallets.txt', 'w', encoding='utf-8') as f:
         for w in sorted_wallets:
             f.write(w + '\n')
 

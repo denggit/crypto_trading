@@ -7,6 +7,7 @@
 import asyncio
 import json
 import os
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -132,11 +133,21 @@ class PortfolioManager:
         self._save_history()
 
     def add_position(self, token_mint, amount_bought, cost_sol):
+        """
+        添加持仓记录
+        
+        Args:
+            token_mint: 代币地址
+            amount_bought: 买入数量
+            cost_sol: 成本（SOL）
+        """
         if token_mint not in self.portfolio:
             self.portfolio[token_mint] = {'my_balance': 0, 'cost_sol': 0}
 
         self.portfolio[token_mint]['my_balance'] += amount_bought
         self.portfolio[token_mint]['cost_sol'] += cost_sol
+        # 🔥 新增：记录买入时间戳，用于防止链上数据同步延迟导致的误判
+        self.portfolio[token_mint]['last_buy_time'] = time.time()
 
         # 更新缓存
         self.buy_counts_cache[token_mint] = self.buy_counts_cache.get(token_mint, 0) + 1
@@ -369,7 +380,9 @@ class PortfolioManager:
                     del self.portfolio[token_mint]
                 # 直接返回，不继续后续逻辑
                 self._save_portfolio()
-                self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
+                # 🔥 修复：将 lamports 转换为 SOL 单位
+                est_sol_out_sol = est_sol_out / 10 ** 9
+                self._record_history("SELL", token_mint, amount_to_sell, est_sol_out_sol)
                 return
 
             # 更新卖出计数缓存
@@ -390,9 +403,26 @@ class PortfolioManager:
                 asyncio.create_task(safe_close_account())
 
             self._save_portfolio()
-            self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
+            # 🔥 修复：将 lamports 转换为 SOL 单位
+            est_sol_out_sol = est_sol_out / 10 ** 9
+            self._record_history("SELL", token_mint, amount_to_sell, est_sol_out_sol)
 
     async def monitor_sync_positions(self):
+        """
+        持仓同步防断网监控线程
+        
+        功能：
+        - 每20秒检查一次持仓
+        - 检测大佬是否已清仓或余额过低
+        - 如果检测到异常，触发强制清仓
+        
+        防护机制：
+        - 买入后60秒内跳过检查，避免链上数据同步延迟导致的误判
+        - 如果获取余额失败，跳过本次检查（网络波动）
+        """
+        # 🔥 买入后保护时间（秒）：避免链上数据同步延迟导致的误判
+        BUY_PROTECTION_TIME = 60
+        
         logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
         async with aiohttp.ClientSession(trust_env=False) as session:
             while self.is_running:
@@ -400,10 +430,25 @@ class PortfolioManager:
                     await asyncio.sleep(5)
                     continue
 
+                current_time = time.time()
+                
                 for token_mint in list(self.portfolio.keys()):
                     try:
                         my_data = self.portfolio[token_mint]
-                        if my_data['my_balance'] <= 0: continue
+                        if my_data['my_balance'] <= 0: 
+                            continue
+
+                        # 🔥 新增：买入后保护期检查，避免链上数据同步延迟导致的误判
+                        last_buy_time = my_data.get('last_buy_time', 0)
+                        if last_buy_time > 0:
+                            time_since_buy = current_time - last_buy_time
+                            if time_since_buy < BUY_PROTECTION_TIME:
+                                remaining_protection = BUY_PROTECTION_TIME - time_since_buy
+                                logger.debug(
+                                    f"🛡️ [保护期] {token_mint[:6]}... 买入后 {time_since_buy:.1f} 秒，"
+                                    f"剩余保护时间 {remaining_protection:.1f} 秒，跳过检查"
+                                )
+                                continue
 
                         sm_amount_raw = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
 
@@ -416,8 +461,17 @@ class PortfolioManager:
                         reason = ""
 
                         if sm_amount_raw == 0:
-                            should_sell = True
-                            reason = "大佬余额为 0"
+                            # 🔥 新增：即使检测到余额为0，也要再次确认（避免误判）
+                            # 等待2秒后再次检查，如果还是0，才触发清仓
+                            await asyncio.sleep(2)
+                            sm_amount_raw_retry = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
+                            if sm_amount_raw_retry is not None and sm_amount_raw_retry == 0:
+                                should_sell = True
+                                reason = "大佬余额为 0 (已二次确认)"
+                            else:
+                                logger.info(
+                                    f"✅ [误判恢复] {token_mint[:6]}... 首次检测为0，二次确认后余额: {sm_amount_raw_retry}"
+                                )
                         else:
                             quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
                                                                 sm_amount_raw)
@@ -513,7 +567,9 @@ class PortfolioManager:
                                             del self.portfolio[token_mint]
                                         # 直接返回，不继续后续逻辑
                                         self._save_portfolio()
-                                        self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out)
+                                        # 🔥 修复：将 lamports 转换为 SOL 单位
+                                        est_sol_out_sol = est_sol_out / 10 ** 9
+                                        self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out_sol)
                                         return
 
                                     # 如果是全清，才删除数据和关账户（成本归零）
@@ -530,11 +586,13 @@ class PortfolioManager:
                                         asyncio.create_task(safe_close_account())
 
                                     self._save_portfolio()
-                                    self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out)
+                                    # 🔥 修复：将 lamports 转换为 SOL 单位
+                                    est_sol_out_sol = est_sol_out / 10 ** 9
+                                    self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out_sol)
 
                                     # 发邮件（包含交易历史表格）
                                     trade_table = self._generate_trade_history_table(token_mint)
-                                    msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi * 100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out / 10 ** 9:.4f}\n剩余仓位: {remaining_balance}\n\n【交易历史记录】\n{trade_table}"
+                                    msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi * 100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out_sol:.4f}\n剩余仓位: {remaining_balance}\n\n【交易历史记录】\n{trade_table}"
                                     # 🔥 修复：添加异常处理
                                     async def safe_send_email():
                                         try:
@@ -576,17 +634,19 @@ class PortfolioManager:
                     logger.error(f"⚠️ 关闭账户失败: {e}")
             asyncio.create_task(safe_close_account())
             self._save_portfolio()
-            self._record_history("SELL_FORCE", token_mint, amount, est_sol_out)
+            # 🔥 修复：将 lamports 转换为 SOL 单位
+            est_sol_out_sol = est_sol_out / 10 ** 9
+            self._record_history("SELL_FORCE", token_mint, amount, est_sol_out_sol)
             
             # 生成交易历史表格
             trade_table = self._generate_trade_history_table(token_mint)
             
             if roi == -0.99:
                 subject = f"🛡️ 防断网风控: {token_mint}"
-                msg = f"检测到聪明钱已清仓，已补救卖出。\n\n代币: {token_mint}\n卖出数量: {amount}\n到手SOL: {est_sol_out / 10 ** 9:.4f}\n\n【交易历史记录】\n{trade_table}"
+                msg = f"检测到聪明钱已清仓，已补救卖出。\n\n代币: {token_mint}\n卖出数量: {amount}\n到手SOL: {est_sol_out_sol:.4f}\n\n【交易历史记录】\n{trade_table}"
             else:
                 subject = f"🚀 暴富止盈: {token_mint}"
-                msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出\n到手SOL: {est_sol_out / 10 ** 9:.4f}\n\n【交易历史记录】\n{trade_table}"
+                msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出\n到手SOL: {est_sol_out_sol:.4f}\n\n【交易历史记录】\n{trade_table}"
             # 🔥 修复：添加异常处理
             async def safe_send_email():
                 try:
