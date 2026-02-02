@@ -365,14 +365,25 @@ class PortfolioManager:
         )
 
         if success:
-            # 🛡️ V4 Pro: 按比例卖出时只减少余额，不减少成本
-            # 原因：避免因为收益达到设定限制而无限减仓
-            # 只有完全清仓时，成本才会归零
+            # 🔥 跟卖逻辑：按比例减少余额和成本
+            # 原因：跟卖是跟随大佬卖出，应该按比例减少成本，保持成本与持仓的对应关系
             my_holdings_before = self.portfolio[token_mint]['my_balance']
+            cost_before = self.portfolio[token_mint]['cost_sol']
             
             if my_holdings_before > 0:
-                # 只减少余额，成本保持不变
+                # 计算卖出比例
+                sell_ratio = amount_to_sell / my_holdings_before
+                
+                # 按比例减少余额和成本
                 self.portfolio[token_mint]['my_balance'] -= amount_to_sell
+                cost_reduction = cost_before * sell_ratio
+                self.portfolio[token_mint]['cost_sol'] = max(0, cost_before - cost_reduction)
+                
+                logger.info(
+                    f"📉 [跟卖记账] {token_mint[:6]}... 卖出 {sell_ratio:.1%} | "
+                    f"余额: {my_holdings_before} -> {self.portfolio[token_mint]['my_balance']} | "
+                    f"成本: {cost_before:.4f} -> {self.portfolio[token_mint]['cost_sol']:.4f} SOL"
+                )
             else:
                 # 如果余额异常（理论上不应该发生），直接删除记录
                 logger.warning(f"⚠️ [异常] {token_mint[:6]}... 卖出时余额异常 ({my_holdings_before})，直接清仓")
@@ -388,7 +399,7 @@ class PortfolioManager:
             # 更新卖出计数缓存
             self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
 
-            # 🛡️ V4 Pro: 只有在完全清仓时，才删除记录（成本归零）
+            # 🛡️ 只有在完全清仓时，才删除记录（成本归零）
             if self.portfolio[token_mint]['my_balance'] < 100:
                 del self.portfolio[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕（成本已归零）")
@@ -549,17 +560,22 @@ class PortfolioManager:
                                 )
 
                                 if success:
-                                    # 🛡️ V4 Pro: 按比例卖出时只减少余额，不减少成本
-                                    # 原因：避免因为收益达到设定限制而无限减仓
+                                    # 🔥 止盈逻辑：只减少余额，不减少成本
+                                    # 原因：止盈是主动止盈，保留成本可以更好地追踪原始投入和真实收益率
                                     # 只有完全清仓时，成本才会归零
                                     my_holdings_before = self.portfolio[token_mint]['my_balance']
                                     
                                     # 先保存剩余仓位（在删除之前）
                                     remaining_balance = my_holdings_before - amount_to_sell
                                     
-                                    # 只减少余额，成本保持不变
+                                    # 只减少余额，成本保持不变（用于追踪原始投入）
                                     if my_holdings_before > 0:
                                         self.portfolio[token_mint]['my_balance'] -= amount_to_sell
+                                        logger.info(
+                                            f"💰 [止盈记账] {token_mint[:6]}... 卖出部分止盈 | "
+                                            f"余额: {my_holdings_before} -> {self.portfolio[token_mint]['my_balance']} | "
+                                            f"成本保持: {self.portfolio[token_mint]['cost_sol']:.4f} SOL (用于追踪原始投入)"
+                                        )
                                     else:
                                         # 如果余额异常（理论上不应该发生），直接删除记录
                                         logger.warning(f"⚠️ [异常] {token_mint[:6]}... 止盈卖出时余额异常 ({my_holdings_before})，直接清仓")
