@@ -46,6 +46,7 @@ TRASH_FILE = str(TOOLS_DIR / "wallets_trash.txt")
 WALLETS_FILE = str(TOOLS_DIR / "wallets_check.txt")
 RESULTS_DIR = str(Path(__file__).parent / "results")
 CONCURRENT_LIMIT = 5  # 并发限制
+DUST_THRESHOLD = 0.01  # 粉尘阈值：未实现收益低于此值的代币视为粉尘
 
 
 def is_valid_solana_address(address: str) -> bool:
@@ -300,16 +301,45 @@ class BatchAnalyzerV2:
             # 使用 API 锁确保同一时间只有一个 API 调用
             async with self.api_lock:
                 # 1. 拉取交易数据（Helius API）
-                txs = await self.analyzer.fetch_history_pagination(session, address, max_txs)
-                if not txs:
+                try:
+                    txs = await self.analyzer.fetch_history_pagination(session, address, max_txs)
+                except Exception as e:
+                    logger.warning(f"获取钱包 {address[:8]}... 交易数据失败: {e}")
                     pbar.update(1)
+                    # 即使失败也要等待，确保API调用间隔
+                    await asyncio.sleep(1.0)
                     return None
                 
-                # 2. 解析代币项目（内部会调用 Jupiter API）
-                analysis_result = await self.analyzer.parse_token_projects(session, txs, address)
-                if not analysis_result.get("results"):
+                # 优化：如果交易数量太少（<10笔），可能不值得分析，提前退出
+                if not txs or len(txs) < 10:
                     pbar.update(1)
+                    # 即使提前退出也要等待，确保API调用间隔
+                    await asyncio.sleep(1.0)
                     return None
+                
+                # Helius API调用完成后，等待1秒再调用Jupiter API
+                await asyncio.sleep(1.0)
+                
+                # 2. 解析代币项目（内部会调用 Jupiter API）
+                try:
+                    analysis_result = await self.analyzer.parse_token_projects(session, txs, address)
+                except Exception as e:
+                    logger.warning(f"解析钱包 {address[:8]}... 代币项目失败: {e}")
+                    pbar.update(1)
+                    # 即使失败也要等待，确保API调用间隔
+                    await asyncio.sleep(1.0)
+                    return None
+                
+                # 优化：如果有效项目太少，提前退出
+                results = analysis_result.get("results", [])
+                if not results or len(results) < 3:
+                    pbar.update(1)
+                    # 即使提前退出也要等待，确保API调用间隔
+                    await asyncio.sleep(1.0)
+                    return None
+                
+                # Jupiter API调用完成后，等待1秒（为下一个钱包的API调用做准备）
+                await asyncio.sleep(1.0)
             
             # === 阶段2：数据处理（可以并发）===
             # 使用数据处理信号量控制并发数，但可以多个任务同时处理
@@ -344,6 +374,22 @@ class BatchAnalyzerV2:
                 total_profit = profit_dim.get("total_profit", 0)
                 max_roi = profit_dim.get("max_roi", 0)
                 
+                # 8. 计算未结算token统计（排除粉尘）
+                unsettled_tokens = [
+                    r for r in results 
+                    if r.get('is_unsettled', False) and r.get('unrealized_sol', 0) >= DUST_THRESHOLD
+                ]
+                
+                unsettled_count = len(unsettled_tokens)
+                unsettled_profit = sum(r.get('unrealized_sol', 0) for r in unsettled_tokens)
+                unsettled_hold_times = [r.get('hold_time', 0) for r in unsettled_tokens if r.get('hold_time', 0) > 0]
+                unsettled_avg_hold_time = sum(unsettled_hold_times) / len(unsettled_hold_times) if unsettled_hold_times else 0
+                
+                # 计算未结算token的总成本（用于计算ROI）
+                # 使用未结算部分的成本，而不是总买入成本
+                unsettled_cost = sum(r.get('unsettled_cost', 0) for r in unsettled_tokens)
+                unsettled_roi = (unsettled_profit / unsettled_cost - 1) if unsettled_cost > 0 else 0
+                
                 pbar.update(1)
                 return {
                     "钱包地址": address,
@@ -372,6 +418,10 @@ class BatchAnalyzerV2:
                     "7天代币数": persistence_dim.get("tokens_7d", 0),
                     "7天交易数": persistence_dim.get("tx_count_7d", 0),
                     "项目总数": len(results),
+                    "未结算token数": unsettled_count,
+                    "未结算盈利(SOL)": round(unsettled_profit, 2),
+                    "未结算ROI": f"{unsettled_roi:.1%}",
+                    "未结算平均持仓(分钟)": round(unsettled_avg_hold_time, 1),
                     "分析时间": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "🛡️ 稳健中军": positioning.get("🛡️ 稳健中军", 0),
                     "⚔️ 土狗猎手": positioning.get("⚔️ 土狗猎手", 0),
@@ -380,7 +430,7 @@ class BatchAnalyzerV2:
                 }
             
         except Exception as e:
-            logger.error(f"分析钱包 {address[:6]}... 时出错: {e}")
+            logger.error(f"分析钱包 {address[:8]}... 时出错: {e}", exc_info=True)
             pbar.update(1)
             return None
     
@@ -399,27 +449,52 @@ class BatchAnalyzerV2:
         
         Args:
             addresses: 钱包地址列表
-            max_txs: 每个钱包最大交易数量
+            max_txs: 每个钱包最大交易数量（默认5000，降低以提升速度）
             
         Returns:
             分析结果列表
         """
         pbar = tqdm(total=len(addresses), desc="📊 审计进度", unit="钱包", colour="green")
         
-        async def analyze_task(session, addr):
+        logger.info(f"开始分析 {len(addresses)} 个钱包（API调用串行，数据处理并发）...")
+        logger.info(f"提示：由于API调用串行化，处理速度较慢，请耐心等待...")
+        
+        async def analyze_task(session, addr, index):
             """
             单个钱包分析任务（生产者）
             内部会通过锁控制API调用串行，数据处理并发
             """
-            return await self.analyze_one_wallet(session, addr, pbar, max_txs)
+            try:
+                result = await self.analyze_one_wallet(session, addr, pbar, max_txs)
+                # 每处理50个钱包输出一次日志
+                if (index + 1) % 50 == 0:
+                    logger.info(f"进度: {index + 1}/{len(addresses)} ({100*(index+1)/len(addresses):.1f}%)")
+                return result
+            except Exception as e:
+                logger.error(f"处理钱包 {addr[:8]}... 时出错: {e}")
+                pbar.update(1)
+                return None
         
         # 创建所有任务并发执行（生产者模式）
         # API调用会在内部通过api_lock串行化
         # 数据处理可以通过data_processing_semaphore并发
         async with aiohttp.ClientSession() as session:
-            tasks = [analyze_task(session, addr) for addr in addresses]
-            raw_results = await asyncio.gather(*tasks)
-            results = [r for r in raw_results if r is not None]
+            tasks = [analyze_task(session, addr, i) for i, addr in enumerate(addresses)]
+            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+            # 过滤掉异常和None
+            results = []
+            exception_count = 0
+            for r in raw_results:
+                if isinstance(r, Exception):
+                    exception_count += 1
+                    if exception_count <= 5:  # 只记录前5个异常
+                        logger.error(f"任务执行异常: {r}")
+            if exception_count > 5:
+                logger.warning(f"还有 {exception_count - 5} 个异常未显示")
+            
+            for r in raw_results:
+                if not isinstance(r, Exception) and r is not None:
+                    results.append(r)
         
         pbar.close()
         return results
@@ -461,7 +536,8 @@ class ReportExporterV2:
                 "7天盈利(SOL)", "7天盈利(%)", "最大单笔ROI", "最大单笔亏损",
                 "平均持仓(分钟)", "盈利持仓(分钟)", "亏损持仓(分钟)",
                 "代币多样性", "30天代币数", "30天交易数", "7天代币数", "7天交易数",
-                "项目总数", "🛡️ 稳健中军", "⚔️ 土狗猎手", "💎 钻石之手", "🚀 短线高手",
+                "项目总数", "未结算token数", "未结算盈利(SOL)", "未结算ROI", "未结算平均持仓(分钟)",
+                "🛡️ 稳健中军", "⚔️ 土狗猎手", "💎 钻石之手", "🚀 短线高手",
                 "分析时间"
             ]
             

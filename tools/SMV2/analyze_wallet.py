@@ -28,9 +28,10 @@ from config.settings import HELIUS_API_KEY, JUPITER_API_KEY
 
 # === ⚙️ 基础配置 ===
 TARGET_TX_COUNT = 20000
-JUPITER_QUOTE_TIMEOUT = 10
-JUPITER_MAX_RETRIES = 2
+JUPITER_QUOTE_TIMEOUT = 5  # 降低超时时间以提升速度
+JUPITER_MAX_RETRIES = 1  # 减少重试次数以提升速度
 MIN_COST_THRESHOLD = 0.05  # 最小成本阈值
+DUST_THRESHOLD = 0.01  # 粉尘阈值：未实现收益低于此值的代币视为粉尘
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 # === 🎯 V2 评分阈值配置 ===
@@ -227,18 +228,37 @@ class PriceFetcher:
             return {}
         
         prices = {}
-        mints_list = list(set(token_mints))
+        mints_list = list(set(token_mints))  # 去重
         
-        tasks = [self._get_single_token_price_sol(mint, max_retries) for mint in mints_list]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # 优化：先查询缓存中已有的，减少API调用
+        cached_prices = {}
+        uncached_mints = []
+        for mint in mints_list:
+            if mint in self._price_cache:
+                cached_prices[mint] = self._price_cache[mint]
+            else:
+                uncached_mints.append(mint)
         
-        for mint, result in zip(mints_list, results):
-            if isinstance(result, Exception):
-                logger.debug(f"获取 {mint[:8]}... 价格失败: {result}")
+        # 只对未缓存的代币进行API查询（串行，因为API不能并发）
+        for i, mint in enumerate(uncached_mints):
+            try:
+                result = await self._get_single_token_price_sol(mint, max_retries)
+                if result is not None and result > 0:
+                    prices[mint] = result
+                    self._price_cache[mint] = result
+                
+                # API调用间隔：除了最后一个，每个调用后等待1秒
+                if i < len(uncached_mints) - 1:
+                    await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.debug(f"获取 {mint[:8]}... 价格失败: {e}")
+                # 即使失败也要等待，确保API调用间隔
+                if i < len(uncached_mints) - 1:
+                    await asyncio.sleep(1.0)
                 continue
-            if result is not None and result > 0:
-                prices[mint] = result
-                self._price_cache[mint] = result
+        
+        # 合并缓存和查询结果
+        prices.update(cached_prices)
         
         return prices
     
@@ -265,11 +285,11 @@ class PriceFetcher:
         if token_mint == WSOL_MINT:
             return 1.0
         
-        # 使用 Jupiter API 询价
+        # 使用 Jupiter API 询价（优化：优先尝试最常见的decimals）
         test_amounts = [
-            int(1e6),   # 1 个代币（6 位小数）
-            int(1e9),  # 1 个代币（9 位小数）
-            int(1e8),  # 1 个代币（8 位小数）
+            int(1e9),  # 1 个代币（9 位小数，最常见）
+            int(1e6),  # 1 个代币（6 位小数）
+            # 移除8位小数，减少API调用次数
         ]
         
         url = "https://api.jup.ag/swap/v1/quote"
@@ -279,7 +299,7 @@ class PriceFetcher:
         
         timeout = aiohttp.ClientTimeout(total=JUPITER_QUOTE_TIMEOUT)
         
-        for quote_amount in test_amounts:
+        for quote_idx, quote_amount in enumerate(test_amounts):
             params = {
                 "inputMint": token_mint,
                 "outputMint": WSOL_MINT,
@@ -287,6 +307,10 @@ class PriceFetcher:
                 "slippageBps": "50",
                 "onlyDirectRoutes": "false",
             }
+            
+            # 不同quote_amount之间等待1秒
+            if quote_idx > 0:
+                await asyncio.sleep(1.0)
             
             for attempt in range(max_retries):
                 try:
@@ -298,27 +322,42 @@ class PriceFetcher:
                                 decimals = 6 if quote_amount == int(1e6) else (9 if quote_amount == int(1e9) else 8)
                                 price_sol = (out_amount / 1e9) / (quote_amount / (10 ** decimals))
                                 if 0.000001 <= price_sol <= 1000:
+                                    # 成功获取价格后，等待1秒（为下一个API调用做准备）
+                                    await asyncio.sleep(1.0)
                                     return price_sol
+                            # 即使out_amount为0，也要等待1秒
+                            await asyncio.sleep(1.0)
                         elif resp.status == 429:
-                            wait_time = (attempt + 1) * 2
+                            wait_time = max((attempt + 1) * 2, 1.0)  # 至少等待1秒
                             logger.debug(f"Jupiter rate limited, waiting {wait_time}s")
                             await asyncio.sleep(wait_time)
                             continue
                         else:
+                            # 非200状态码，等待1秒
+                            await asyncio.sleep(1.0)
                             if attempt < max_retries - 1:
-                                await asyncio.sleep(1)
-                            break
+                                continue
+                            else:
+                                break
                 except asyncio.TimeoutError:
+                    # 超时后等待1秒
+                    await asyncio.sleep(1.0)
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(1)
+                        continue
                     else:
                         break
                 except Exception as e:
                     logger.debug(f"Jupiter API error for {token_mint[:8]}...: {e}")
+                    # 异常后等待1秒
+                    await asyncio.sleep(1.0)
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(1)
+                        continue
                     else:
                         break
+                
+                # 每次尝试之间等待1秒（除了最后一次）
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.0)
         
         return None
 
@@ -403,7 +442,7 @@ class WalletAnalyzerV2:
                     
                     last_signature = data[-1].get('signature')
                     retry_count = 0
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(1.0)  # API调用间隔至少1秒
                     
             except aiohttp.ClientError as e:
                 logger.error(f"Network error fetching transactions: {e}")
@@ -505,8 +544,16 @@ class WalletAnalyzerV2:
             if (v["buy_tokens"] - v["sell_tokens"]) > 0 and v["buy_sol"] >= MIN_COST_THRESHOLD
         ]
         
-        logger.debug(f"正在获取 {len(active_mints)} 个代币的 SOL 价格...")
-        prices_sol = await price_fetcher.get_token_prices_in_sol(active_mints)
+        # 优化：如果持仓代币太多，只查询前50个（避免查询时间过长）
+        if len(active_mints) > 50:
+            logger.debug(f"持仓代币过多({len(active_mints)}个)，仅查询前50个的价格")
+            active_mints = active_mints[:50]
+        
+        if active_mints:
+            logger.debug(f"正在获取 {len(active_mints)} 个代币的 SOL 价格...")
+            prices_sol = await price_fetcher.get_token_prices_in_sol(active_mints)
+        else:
+            prices_sol = {}
         
         # 生成最终结果
         final_results = []
@@ -532,6 +579,11 @@ class WalletAnalyzerV2:
             if data["last_time"] > 0 and data["first_time"] > 0:
                 hold_time_minutes = (data["last_time"] - data["first_time"]) / 60
             
+            # 计算未结算部分的成本（按比例分配）
+            unsettled_cost = 0.0
+            if remaining_tokens > 0 and data["buy_tokens"] > 0:
+                unsettled_cost = data["buy_sol"] * (remaining_tokens / data["buy_tokens"])
+            
             final_results.append({
                 "token": mint,
                 "cost": data["buy_sol"],
@@ -542,7 +594,11 @@ class WalletAnalyzerV2:
                 "first_time": data["first_time"],
                 "last_time": data["last_time"],
                 "transactions": data["transactions"],
-                "has_price": price_sol > 0
+                "has_price": price_sol > 0,
+                "remaining_tokens": remaining_tokens,  # 剩余代币数量
+                "unrealized_sol": unrealized_sol,  # 未实现收益（SOL）
+                "unsettled_cost": unsettled_cost,  # 未结算部分的成本
+                "is_unsettled": remaining_tokens > 0  # 是否未结算
             })
         
         return {
@@ -718,28 +774,28 @@ class WalletScorerV2:
         elif profit_factor > 0:
             profit_score += 5
         
-        # 30天盈利评分（30分）
-        if profit_30d >= 200:
+        # 30天盈利评分（30分）- 按百分比计算
+        if profit_pct_30d >= 100:  # >= 100%
             profit_score += 30
-        elif profit_30d >= 100:
+        elif profit_pct_30d >= 80:
             profit_score += 25
-        elif profit_30d >= 50:
+        elif profit_pct_30d >= 50:
             profit_score += 20
-        elif profit_30d >= 20:
+        elif profit_pct_30d >= 30:
             profit_score += 15
-        elif profit_30d >= 10:
+        elif profit_pct_30d >= 10:
             profit_score += 10
-        elif profit_30d > 0:
+        elif profit_pct_30d > 0:
             profit_score += 5
         
-        # 7天盈利评分（20分）
-        if profit_7d >= 50:
+        # 7天盈利评分（20分）- 按百分比计算
+        if profit_pct_7d >= 30:  # >= 30%
             profit_score += 20
-        elif profit_7d >= 20:
+        elif profit_pct_7d >= 20:
             profit_score += 15
-        elif profit_7d >= 10:
+        elif profit_pct_7d >= 10:
             profit_score += 10
-        elif profit_7d > 0:
+        elif profit_pct_7d > 0:
             profit_score += 5
         
         # 单币ROI评分（20分）
@@ -952,25 +1008,53 @@ class WalletScorerV2:
             "reasons": []
         }
         
+        # 基础指标
+        win_rate = persistence_dim.get("win_rate", 0)
+        max_loss = profit_dim.get("max_single_loss", 0)
+        unique_tokens = authenticity_dim.get("unique_tokens", 0)
+        total_profit = profit_dim.get("total_profit", 0)
+        profit_factor = profit_dim.get("profit_factor", 0)
+        avg_hold_time = authenticity_dim.get("avg_hold_time", 0)
+        
         # 1. 快枪手：平均持仓时间 < 1 分钟
-        if authenticity_dim.get("avg_hold_time", 0) < FAST_GUN_THRESHOLD_MINUTES:
+        if avg_hold_time < FAST_GUN_THRESHOLD_MINUTES:
             flags["is_trash"] = True
             flags["reasons"].append("快枪手：平均持仓时间 < 1 分钟")
         
         # 2. 归零战神：胜率 >= 90% 且最大亏损 <= -95%
-        win_rate = persistence_dim.get("win_rate", 0)
-        max_loss = profit_dim.get("max_single_loss", 0)
         if win_rate >= ZERO_WARRIOR_WIN_RATE and max_loss <= ZERO_WARRIOR_MAX_LOSS:
             flags["is_trash"] = True
             flags["reasons"].append("归零战神：胜率高但一输就归零")
         
         # 3. 内幕狗：只交易过 1-2 个代币
-        unique_tokens = authenticity_dim.get("unique_tokens", 0)
         if unique_tokens <= INSIDER_DOG_MAX_TOKENS:
             flags["is_trash"] = True
             flags["reasons"].append(f"内幕狗：只交易过 {unique_tokens} 个代币")
         
-        # 4. 最大单笔亏损超过 -50%（不符合S级标准）
+        # 4. 交易超过5个代币但目前仍然处于亏损
+        if unique_tokens > 5 and total_profit < 0:
+            flags["is_trash"] = True
+            flags["reasons"].append(f"交易{unique_tokens}个代币但仍亏损 {total_profit:.2f} SOL")
+        
+        # 5. 超过两个代币交易亏损<=-95%
+        if unique_tokens > 2:
+            # 统计亏损<=-95%的代币数量
+            severe_losses = [r for r in losses if r.get('roi', 0) <= -0.95]
+            if len(severe_losses) >= 2:
+                flags["is_trash"] = True
+                flags["reasons"].append(f"有{len(severe_losses)}个代币亏损<=-95%")
+        
+        # 6. 交易超过5个代币，盈亏比小于1
+        if unique_tokens > 5 and profit_factor < 1.0:
+            flags["is_trash"] = True
+            flags["reasons"].append(f"交易{unique_tokens}个代币但盈亏比{profit_factor:.2f} < 1")
+        
+        # 7. 胜率小于40%的同时盈亏比小于2
+        if win_rate < 0.40 and profit_factor < 2.0:
+            flags["is_trash"] = True
+            flags["reasons"].append(f"胜率{win_rate:.1%} < 40% 且盈亏比{profit_factor:.2f} < 2")
+        
+        # 8. 最大单笔亏损超过 -50%（不符合S级标准，仅警告）
         if max_loss < S_TIER_MAX_SINGLE_LOSS:
             flags["reasons"].append(f"最大单笔亏损 {max_loss:.1%} 超过 -50%，缺乏止损纪律")
         
@@ -1052,7 +1136,7 @@ class WalletScorerV2:
         )
         
         # 根据S级标准进行额外加分
-        profit_30d = profit_dim.get("profit_30d", 0)
+        profit_pct_30d = profit_dim.get("profit_pct_30d", 0)
         tokens_30d = persistence_dim.get("tokens_30d", 0)
         win_rate = persistence_dim.get("win_rate", 0)
         avg_hold_hours = authenticity_dim.get("avg_hold_time", 0) / 60
@@ -1060,7 +1144,7 @@ class WalletScorerV2:
         
         # S级加分（最多+20分）
         bonus = 0
-        if profit_30d >= S_TIER_MIN_PROFIT_30D:
+        if profit_pct_30d >= 100:  # 30天盈利 >= 100%
             bonus += 5
         if tokens_30d >= S_TIER_MIN_TOKENS_30D:
             bonus += 5
