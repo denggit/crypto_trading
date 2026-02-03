@@ -2,19 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 @File       : batch_analyze.py
-@Description: 批量钱包分析工具 (V5 优化版)
+@Description: 批量钱包分析工具 V2 (超严格版)
               - 批量分析多个钱包地址
               - 自动黑名单过滤低质量钱包
-              - 导出 Excel 报告
+              - 导出 Excel 报告（包含详细评分和定位）
               - 改进错误处理和日志记录
 @Author     : Auto-generated
-@Date       : 2026-02-01
+@Date       : 2026-02-02
 """
 import asyncio
 import logging
 import os
 import re
-import statistics
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +28,7 @@ current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
 try:
-    from analyze_wallet import WalletAnalyzer, get_detailed_scores
+    from analyze_wallet import WalletAnalyzerV2, WalletScorerV2
 except ImportError:
     print("❌ 错误：找不到 analyze_wallet 模块")
     sys.exit(1)
@@ -42,14 +41,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === ⚙️ 配置常量 ===
-# 文件路径：指向 tools 目录（父目录）
 TOOLS_DIR = Path(__file__).parent.parent
 TRASH_FILE = str(TOOLS_DIR / "wallets_trash.txt")
 WALLETS_FILE = str(TOOLS_DIR / "wallets_check.txt")
-RESULTS_DIR = str(TOOLS_DIR / "results")
-MIN_SCORE_THRESHOLD_1 = 45  # 评分阈值1：低于此值且代币数>=10时加入黑名单
-MIN_SCORE_THRESHOLD_2 = 20  # 评分阈值2：低于此值直接加入黑名单
-CONCURRENT_LIMIT = 3  # 并发限制
+RESULTS_DIR = str(Path(__file__).parent / "results")
+CONCURRENT_LIMIT = 5  # 并发限制
 
 
 def is_valid_solana_address(address: str) -> bool:
@@ -134,11 +130,6 @@ class WalletListSaver:
 class TrashListManager:
     """
     黑名单管理器：负责管理低质量钱包黑名单
-    
-    职责：
-    - 加载黑名单
-    - 添加地址到黑名单
-    - 检查地址是否在黑名单中
     """
     
     def __init__(self, trash_file: str = TRASH_FILE):
@@ -248,14 +239,14 @@ class WalletListLoader:
             return []
 
 
-class BatchAnalyzer:
+class BatchAnalyzerV2:
     """
-    批量分析器：负责批量分析多个钱包
+    批量分析器 V2：负责批量分析多个钱包（超严格版）
     
     职责：
     - 并发分析多个钱包（数据处理并发，API调用串行）
-    - 自动过滤低质量钱包
-    - 生成分析报告
+    - 自动过滤低质量钱包（垃圾地址）
+    - 生成详细分析报告
     
     设计：
     - 使用生产者-消费者模式
@@ -265,7 +256,7 @@ class BatchAnalyzer:
     
     def __init__(
         self,
-        analyzer: WalletAnalyzer,
+        analyzer: WalletAnalyzerV2,
         trash_manager: TrashListManager,
         concurrent_limit: int = CONCURRENT_LIMIT
     ):
@@ -315,8 +306,8 @@ class BatchAnalyzer:
                     return None
                 
                 # 2. 解析代币项目（内部会调用 Jupiter API）
-                results = await self.analyzer.parse_token_projects(session, txs, address)
-                if not results:
+                analysis_result = await self.analyzer.parse_token_projects(session, txs, address)
+                if not analysis_result.get("results"):
                     pbar.update(1)
                     return None
             
@@ -324,56 +315,68 @@ class BatchAnalyzer:
             # 使用数据处理信号量控制并发数，但可以多个任务同时处理
             async with self.data_processing_semaphore:
                 # 3. 计算评分（纯计算，无API调用）
-                score, tier, desc, radar = get_detailed_scores(results)
+                scores = WalletScorerV2.calculate_scores(analysis_result)
                 
-                # 4. 自动黑名单过滤
-                if score < MIN_SCORE_THRESHOLD_1 and len(results) >= 10:
-                    self.trash_manager.add(address)
-                    pbar.update(1)
-                    return None
-                elif score < MIN_SCORE_THRESHOLD_2 and len(results) >= 5:
+                # 4. 自动黑名单过滤（垃圾地址）
+                if scores["flags"].get("is_trash", False):
                     self.trash_manager.add(address)
                     pbar.update(1)
                     return None
                 
-                # 5. 提取最佳定位
+                # 5. 提取详细指标（纯数据处理）
+                results = analysis_result["results"]
+                dims = scores["dimensions"]
+                profit_dim = dims["profit"]
+                persistence_dim = dims["persistence"]
+                authenticity_dim = dims["authenticity"]
+                positioning = scores["positioning"]
+                
+                # 6. 提取最佳定位
                 best_role = "未知"
-                if radar:
-                    best_role = max(radar, key=radar.get)
+                best_role_score = 0
+                if positioning:
+                    best_role = max(positioning, key=positioning.get)
+                    best_role_score = positioning[best_role]
                 
-                # 6. 计算基础指标（纯数据处理）
+                # 7. 计算基础指标
                 wins = [r for r in results if r.get('is_win', False)]
                 win_rate = len(wins) / len(results) if results else 0
-                total_profit = sum(r.get('profit', 0) for r in results)
-                max_roi = max([r.get('roi', 0) for r in results]) if results else 0
-                hold_times = [r.get('hold_time', 0) for r in results if r.get('hold_time', 0) > 0]
-                median_hold = statistics.median(hold_times) if hold_times else 0
-                
-                # 提取置信度
-                confidence = "高" if len(results) > 10 else "低"
-                
-                # 解析盈亏比
-                profit_factor = 0.0
-                try:
-                    profit_factor_str = desc.split("|")[0].split(":")[-1].strip()
-                    profit_factor = float(profit_factor_str)
-                except (ValueError, IndexError):
-                    logger.warning(f"无法解析盈亏比: {desc}")
+                total_profit = profit_dim.get("total_profit", 0)
+                max_roi = profit_dim.get("max_roi", 0)
                 
                 pbar.update(1)
                 return {
                     "钱包地址": address,
-                    "综合评分": score,
-                    "战力评级": tier,
-                    "置信度": confidence,
+                    "综合评分": scores["final_score"],
+                    "战力评级": scores["tier"],
                     "最佳定位": best_role,
-                    "盈亏比": profit_factor,
+                    "定位评分": best_role_score,
+                    "盈利力评分": profit_dim.get("score", 0),
+                    "持久力评分": persistence_dim.get("score", 0),
+                    "真实性评分": authenticity_dim.get("score", 0),
+                    "盈亏比": round(profit_dim.get("profit_factor", 0), 2),
+                    "胜率": round(win_rate, 3),
                     "总盈亏(SOL)": round(total_profit, 2),
-                    "胜率": win_rate,
+                    "30天盈利(SOL)": round(profit_dim.get("profit_30d", 0), 2),
+                    "30天盈利(%)": round(profit_dim.get("profit_pct_30d", 0), 2),
+                    "7天盈利(SOL)": round(profit_dim.get("profit_7d", 0), 2),
+                    "7天盈利(%)": round(profit_dim.get("profit_pct_7d", 0), 2),
                     "最大单笔ROI": f"{max_roi:.0%}",
-                    "中位持仓(分)": round(median_hold, 1),
-                    "代币数": len(results),
-                    "分析时间": datetime.now().strftime("%Y-%m-%d %H:%M")
+                    "最大单笔亏损": f"{profit_dim.get('max_single_loss', 0):.1%}",
+                    "平均持仓(分钟)": round(authenticity_dim.get("avg_hold_time", 0), 1),
+                    "盈利持仓(分钟)": round(authenticity_dim.get("avg_win_hold_time", 0), 1),
+                    "亏损持仓(分钟)": round(authenticity_dim.get("avg_loss_hold_time", 0), 1),
+                    "代币多样性": authenticity_dim.get("unique_tokens", 0),
+                    "30天代币数": persistence_dim.get("tokens_30d", 0),
+                    "30天交易数": persistence_dim.get("tx_count_30d", 0),
+                    "7天代币数": persistence_dim.get("tokens_7d", 0),
+                    "7天交易数": persistence_dim.get("tx_count_7d", 0),
+                    "项目总数": len(results),
+                    "分析时间": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "🛡️ 稳健中军": positioning.get("🛡️ 稳健中军", 0),
+                    "⚔️ 土狗猎手": positioning.get("⚔️ 土狗猎手", 0),
+                    "💎 钻石之手": positioning.get("💎 钻石之手", 0),
+                    "🚀 短线高手": positioning.get("🚀 短线高手", 0),
                 }
             
         except Exception as e:
@@ -422,9 +425,9 @@ class BatchAnalyzer:
         return results
 
 
-class ReportExporter:
+class ReportExporterV2:
     """
-    报告导出器：负责导出分析结果到 Excel
+    报告导出器 V2：负责导出分析结果到 Excel（包含详细评分）
     """
     
     @staticmethod
@@ -447,9 +450,28 @@ class ReportExporter:
         os.makedirs(output_dir, exist_ok=True)
         
         try:
+            # 按综合评分排序
             df = pd.DataFrame(results).sort_values(by="综合评分", ascending=False)
+            
+            # 重新排列列的顺序，让重要信息在前面
+            important_cols = [
+                "钱包地址", "综合评分", "战力评级", "最佳定位", "定位评分",
+                "盈利力评分", "持久力评分", "真实性评分",
+                "盈亏比", "胜率", "总盈亏(SOL)", "30天盈利(SOL)", "30天盈利(%)",
+                "7天盈利(SOL)", "7天盈利(%)", "最大单笔ROI", "最大单笔亏损",
+                "平均持仓(分钟)", "盈利持仓(分钟)", "亏损持仓(分钟)",
+                "代币多样性", "30天代币数", "30天交易数", "7天代币数", "7天交易数",
+                "项目总数", "🛡️ 稳健中军", "⚔️ 土狗猎手", "💎 钻石之手", "🚀 短线高手",
+                "分析时间"
+            ]
+            
+            # 确保所有列都存在
+            available_cols = [col for col in important_cols if col in df.columns]
+            remaining_cols = [col for col in df.columns if col not in available_cols]
+            df = df[available_cols + remaining_cols]
+            
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = os.path.join(output_dir, f"wallet_ranking_v5_{timestamp}.xlsx")
+            output_file = os.path.join(output_dir, f"wallet_ranking_v2_{timestamp}.xlsx")
             df.to_excel(output_file, index=False, engine='openpyxl')
             logger.info(f"导出成功: {output_file} ({len(results)} 条记录)")
             return output_file
@@ -461,10 +483,10 @@ class ReportExporter:
 async def main():
     """主函数：批量分析入口"""
     # 初始化组件
-    analyzer = WalletAnalyzer()
+    analyzer = WalletAnalyzerV2()
     trash_manager = TrashListManager()
-    batch_analyzer = BatchAnalyzer(analyzer, trash_manager, CONCURRENT_LIMIT)
-    exporter = ReportExporter()
+    batch_analyzer = BatchAnalyzerV2(analyzer, trash_manager, CONCURRENT_LIMIT)
+    exporter = ReportExporterV2()
     
     # 加载钱包列表和黑名单
     trash_set = trash_manager.load()
@@ -482,7 +504,7 @@ async def main():
         print(f"🚫 库中所有地址都在黑名单内，或没有新地址。")
         return
     
-    print(f"🚀 启动批量分析 V5 | 任务数: {len(addresses)} (跳过黑名单: {skip_count})")
+    print(f"🚀 启动批量分析 V2 (超严格版) | 任务数: {len(addresses)} (跳过黑名单: {skip_count})")
     
     # 执行批量分析
     results = await batch_analyzer.analyze_batch(addresses)
@@ -492,6 +514,13 @@ async def main():
         output_file = exporter.export(results)
         if output_file:
             print(f"\n✅ 导出成功: {output_file}")
+            print(f"📊 共分析 {len(results)} 个钱包，已按综合评分排序")
+            
+            # 显示前5名
+            if len(results) > 0:
+                print("\n🏆 Top 5 钱包:")
+                for i, r in enumerate(results[:5], 1):
+                    print(f"  {i}. {r['钱包地址'][:8]}... | 评分: {r['综合评分']} | 评级: {r['战力评级']} | 定位: {r['最佳定位']} | 30天盈利: {r['30天盈利(SOL)']:+.2f} SOL")
         else:
             print("\n⚠️ 导出失败")
     else:
