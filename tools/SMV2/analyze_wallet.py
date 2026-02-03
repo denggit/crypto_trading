@@ -197,15 +197,17 @@ class PriceFetcher:
     价格获取器：负责获取代币价格（直接获取 SOL 价格）
     """
     
-    def __init__(self, session: aiohttp.ClientSession, jupiter_api_key: str = None):
+    def __init__(self, session: aiohttp.ClientSession, jupiter_api_key: str = None, jupiter_key_manager = None):
         """
         初始化价格获取器
         
         Args:
             session: aiohttp 会话对象
-            jupiter_api_key: Jupiter API 密钥（可选）
+            jupiter_api_key: Jupiter API 密钥（可选，如果提供key_manager则忽略）
+            jupiter_key_manager: Jupiter API Key 管理器（用于轮询使用多个key）
         """
         self.session = session
+        self.jupiter_key_manager = jupiter_key_manager
         self.jupiter_api_key = jupiter_api_key or JUPITER_API_KEY
         self._price_cache: Dict[str, float] = {}
     
@@ -240,22 +242,19 @@ class PriceFetcher:
                 uncached_mints.append(mint)
         
         # 只对未缓存的代币进行API查询（串行，因为API不能并发）
+        # 同一API（Jupiter）的调用之间需要间隔1秒
         for i, mint in enumerate(uncached_mints):
             try:
                 result = await self._get_single_token_price_sol(mint, max_retries)
                 if result is not None and result > 0:
                     prices[mint] = result
                     self._price_cache[mint] = result
-                
-                # API调用间隔：除了最后一个，每个调用后等待1秒
-                if i < len(uncached_mints) - 1:
-                    await asyncio.sleep(1.0)
             except Exception as e:
                 logger.debug(f"获取 {mint[:8]}... 价格失败: {e}")
-                # 即使失败也要等待，确保API调用间隔
-                if i < len(uncached_mints) - 1:
-                    await asyncio.sleep(1.0)
-                continue
+            
+            # Jupiter API调用间隔：除了最后一个，每个调用后等待1秒
+            if i < len(uncached_mints) - 1:
+                await asyncio.sleep(1.0)
         
         # 合并缓存和查询结果
         prices.update(cached_prices)
@@ -294,11 +293,54 @@ class PriceFetcher:
         
         url = "https://api.jup.ag/swap/v1/quote"
         headers = {"Accept": "application/json"}
-        if self.jupiter_api_key:
+        
+        # 使用 key_manager 轮询获取 key 和锁，或使用固定的 key
+        jupiter_key = None
+        jupiter_lock = None
+        if self.jupiter_key_manager:
+            # 异步获取key和锁（需要在调用前await）
+            jupiter_key, jupiter_lock = await self.jupiter_key_manager.get_key_and_lock()
+            if jupiter_key:
+                headers["x-api-key"] = jupiter_key
+        elif self.jupiter_api_key:
             headers["x-api-key"] = self.jupiter_api_key
         
         timeout = aiohttp.ClientTimeout(total=JUPITER_QUOTE_TIMEOUT)
         
+        # 如果有锁，在整个API调用期间保持锁（确保同一Key间隔1秒）
+        if jupiter_lock:
+            async with jupiter_lock:
+                return await self._fetch_price_with_retries(
+                    url, headers, timeout, test_amounts, token_mint, max_retries
+                )
+        else:
+            return await self._fetch_price_with_retries(
+                url, headers, timeout, test_amounts, token_mint, max_retries
+            )
+    
+    async def _fetch_price_with_retries(
+        self,
+        url: str,
+        headers: dict,
+        timeout: aiohttp.ClientTimeout,
+        test_amounts: List[int],
+        token_mint: str,
+        max_retries: int
+    ) -> Optional[float]:
+        """
+        使用重试机制获取价格
+        
+        Args:
+            url: API URL
+            headers: 请求头
+            timeout: 超时设置
+            test_amounts: 测试金额列表
+            token_mint: 代币地址
+            max_retries: 最大重试次数
+            
+        Returns:
+            价格，失败返回None
+        """
         for quote_idx, quote_amount in enumerate(test_amounts):
             params = {
                 "inputMint": token_mint,
@@ -322,11 +364,10 @@ class PriceFetcher:
                                 decimals = 6 if quote_amount == int(1e6) else (9 if quote_amount == int(1e9) else 8)
                                 price_sol = (out_amount / 1e9) / (quote_amount / (10 ** decimals))
                                 if 0.000001 <= price_sol <= 1000:
-                                    # 成功获取价格后，等待1秒（为下一个API调用做准备）
-                                    await asyncio.sleep(1.0)
+                                    # 成功获取价格，缓存并返回
+                                    self._price_cache[token_mint] = price_sol
                                     return price_sol
-                            # 即使out_amount为0，也要等待1秒
-                            await asyncio.sleep(1.0)
+                            # out_amount为0，继续尝试下一个quote_amount
                         elif resp.status == 429:
                             wait_time = max((attempt + 1) * 2, 1.0)  # 至少等待1秒
                             logger.debug(f"Jupiter rate limited, waiting {wait_time}s")
@@ -360,6 +401,20 @@ class PriceFetcher:
                     await asyncio.sleep(1.0)
         
         return None
+    
+    def clear_cache(self, max_size: int = 1000):
+        """
+        清理价格缓存，释放内存
+        
+        Args:
+            max_size: 缓存最大大小，超过此大小则清理一半
+        """
+        if len(self._price_cache) > max_size:
+            # 保留最近的一半缓存（简单策略：随机保留一半）
+            import random
+            keys_to_keep = random.sample(list(self._price_cache.keys()), max_size // 2)
+            self._price_cache = {k: self._price_cache[k] for k in keys_to_keep}
+            logger.debug(f"清理价格缓存: {len(self._price_cache)} 个条目保留")
 
 
 class WalletAnalyzerV2:
@@ -378,17 +433,18 @@ class WalletAnalyzerV2:
         初始化钱包分析器
         
         Args:
-            helius_api_key: Helius API 密钥
+            helius_api_key: Helius API 密钥（可选，如果使用key_manager则不需要）
         """
+        # 如果提供了key就使用，否则留空（会在调用时通过key_manager获取）
         self.helius_api_key = helius_api_key or HELIUS_API_KEY
-        if not self.helius_api_key:
-            raise ValueError("HELIUS_API_KEY 未配置")
+        # 不再强制要求，因为可以通过key_manager动态获取
     
     async def fetch_history_pagination(
         self,
         session: aiohttp.ClientSession,
         address: str,
-        max_count: int = 3000
+        max_count: int = 3000,
+        helius_api_key: str = None
     ) -> List[dict]:
         """
         分页获取钱包交易历史
@@ -397,10 +453,16 @@ class WalletAnalyzerV2:
             session: aiohttp 会话对象
             address: 钱包地址
             max_count: 最大获取数量
+            helius_api_key: Helius API 密钥（如果提供则使用，否则使用初始化时的key）
             
         Returns:
             交易列表
         """
+        # 使用传入的key或默认key
+        api_key = helius_api_key or self.helius_api_key
+        if not api_key:
+            raise ValueError("Helius API Key 未配置")
+        
         all_txs = []
         last_signature = None
         retry_count = 0
@@ -409,7 +471,7 @@ class WalletAnalyzerV2:
         while len(all_txs) < max_count:
             url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
             params = {
-                "api-key": self.helius_api_key,
+                "api-key": api_key,
                 "type": "SWAP",
                 "limit": 100
             }
@@ -427,6 +489,11 @@ class WalletAnalyzerV2:
                         logger.info(f"Rate limited, waiting {wait_time}s")
                         await asyncio.sleep(wait_time)
                         continue
+                    
+                    if resp.status == 404:
+                        # 404 表示地址不存在，直接返回空列表（上层会处理加入黑名单）
+                        logger.debug(f"地址不存在 (404): {address[:8]}...")
+                        return []
                     
                     if resp.status != 200:
                         logger.warning(f"API returned status {resp.status}, stopping")
@@ -457,7 +524,8 @@ class WalletAnalyzerV2:
         self,
         session: aiohttp.ClientSession,
         transactions: List[dict],
-        target_wallet: str
+        target_wallet: str,
+        jupiter_key_manager = None
     ) -> Dict:
         """
         解析交易并计算每个代币项目的收益（V2版本：包含时间窗口分析）
@@ -466,6 +534,7 @@ class WalletAnalyzerV2:
             session: aiohttp 会话对象
             transactions: 交易列表
             target_wallet: 目标钱包地址
+            jupiter_key_manager: Jupiter API Key 管理器（用于轮询使用多个key）
             
         Returns:
             分析结果字典，包含详细指标
@@ -473,7 +542,9 @@ class WalletAnalyzerV2:
         # 初始化组件
         parser = TransactionParser(target_wallet)
         attribution_calc = TokenAttributionCalculator()
-        price_fetcher = PriceFetcher(session)
+        price_fetcher = PriceFetcher(session, jupiter_key_manager=jupiter_key_manager)
+        # 保存price_fetcher引用，用于后续清理缓存
+        self.price_fetcher = price_fetcher
         
         # 项目数据：{mint: {buy_sol, sell_sol, buy_tokens, sell_tokens, first_time, last_time, transactions}}
         projects = defaultdict(lambda: {
@@ -1021,28 +1092,28 @@ class WalletScorerV2:
             flags["is_trash"] = True
             flags["reasons"].append("快枪手：平均持仓时间 < 1 分钟")
         
-        # 2. 归零战神：胜率 >= 90% 且最大亏损 <= -95%
-        if win_rate >= ZERO_WARRIOR_WIN_RATE and max_loss <= ZERO_WARRIOR_MAX_LOSS:
-            flags["is_trash"] = True
-            flags["reasons"].append("归零战神：胜率高但一输就归零")
+        # 2. 归零战神：胜率 >= 90% 且最大亏损 <= -95%（已移除，不加入黑名单）
+        # if win_rate >= ZERO_WARRIOR_WIN_RATE and max_loss <= ZERO_WARRIOR_MAX_LOSS:
+        #     flags["is_trash"] = True
+        #     flags["reasons"].append("归零战神：胜率高但一输就归零")
         
-        # 3. 内幕狗：只交易过 1-2 个代币
-        if unique_tokens <= INSIDER_DOG_MAX_TOKENS:
-            flags["is_trash"] = True
-            flags["reasons"].append(f"内幕狗：只交易过 {unique_tokens} 个代币")
+        # 3. 内幕狗：只交易过 1-2 个代币（已移除，不加入黑名单，万一以后会变强）
+        # if unique_tokens <= INSIDER_DOG_MAX_TOKENS:
+        #     flags["is_trash"] = True
+        #     flags["reasons"].append(f"内幕狗：只交易过 {unique_tokens} 个代币")
         
         # 4. 交易超过5个代币但目前仍然处于亏损
         if unique_tokens > 5 and total_profit < 0:
             flags["is_trash"] = True
             flags["reasons"].append(f"交易{unique_tokens}个代币但仍亏损 {total_profit:.2f} SOL")
         
-        # 5. 超过两个代币交易亏损<=-95%
-        if unique_tokens > 2:
-            # 统计亏损<=-95%的代币数量
-            severe_losses = [r for r in losses if r.get('roi', 0) <= -0.95]
-            if len(severe_losses) >= 2:
-                flags["is_trash"] = True
-                flags["reasons"].append(f"有{len(severe_losses)}个代币亏损<=-95%")
+        # 5. 超过两个代币交易亏损<=-95%（已移除，不加入黑名单，但会在报告中显示数量）
+        # if unique_tokens > 2:
+        #     # 统计亏损<=-95%的代币数量
+        #     severe_losses = [r for r in losses if r.get('roi', 0) <= -0.95]
+        #     if len(severe_losses) >= 2:
+        #         flags["is_trash"] = True
+        #         flags["reasons"].append(f"有{len(severe_losses)}个代币亏损<=-95%")
         
         # 6. 交易超过5个代币，盈亏比小于1
         if unique_tokens > 5 and profit_factor < 1.0:

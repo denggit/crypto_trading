@@ -17,7 +17,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import pandas as pd
@@ -47,6 +47,98 @@ WALLETS_FILE = str(TOOLS_DIR / "wallets_check.txt")
 RESULTS_DIR = str(Path(__file__).parent / "results")
 CONCURRENT_LIMIT = 5  # 并发限制
 DUST_THRESHOLD = 0.01  # 粉尘阈值：未实现收益低于此值的代币视为粉尘
+
+# === 🔑 API Key 列表 ===
+# Helius API Keys（轮询使用）
+HELIUS_KEY_LIST = [
+    # 在这里添加你的 Helius API Keys（最多3个）
+    "8233c4fa-6219-4b4b-8e57-359a14221685",
+    "d7b7997e-6c8b-452f-9007-75ddc5abaffa",
+    "fd6332c8-3091-4824-94fd-d25a70e81584",
+]
+
+# Jupiter API Keys（轮询使用）
+JUPITER_KEY_LIST = [
+    # 在这里添加你的 Jupiter API Keys（最多3个）
+    "861de5e5-cd1b-4e68-8793-d312e8f98ce7",
+    "87a8ad47-1561-4902-8a17-421357eb5b94",
+    "0f4a44ec-7c26-4c29-9209-045eabc748f0",
+]
+
+
+class APIKeyManager:
+    """
+    API Key 管理器：负责管理多个 API Key，允许并行使用，但同一 Key 间隔至少1秒
+    
+    职责：
+    - 为每个 Key 创建独立的锁，允许不同 Key 并行使用
+    - 跟踪每个 Key 的最后调用时间
+    - 确保同一 Key 的调用间隔至少1秒
+    """
+    
+    def __init__(self, key_list: List[str], api_name: str = "API"):
+        """
+        初始化 API Key 管理器
+        
+        Args:
+            key_list: API Key 列表
+            api_name: API 名称（用于日志）
+        """
+        if not key_list:
+            raise ValueError(f"{api_name} Key 列表不能为空")
+        self.key_list = [k for k in key_list if k and k.strip()]  # 过滤空值
+        if not self.key_list:
+            raise ValueError(f"{api_name} Key 列表中没有有效的 Key")
+        self.api_name = api_name
+        # 为每个 Key 创建独立的锁和调用时间跟踪
+        self.key_locks: Dict[str, asyncio.Lock] = {key: asyncio.Lock() for key in self.key_list}
+        self.last_call_times: Dict[str, float] = {}  # {key: last_call_timestamp}
+        self.current_index = 0
+        self._index_lock = asyncio.Lock()  # 用于轮询选择Key的锁
+        logger.info(f"初始化 {api_name} Key 管理器: {len(self.key_list)} 个 Keys（支持并行）")
+    
+    async def get_key_and_lock(self) -> Tuple[str, asyncio.Lock]:
+        """
+        获取下一个可用的 API Key 和对应的锁（确保间隔至少1秒）
+        
+        Returns:
+            (key, lock): 可用的 API Key 和对应的锁
+        """
+        import time
+        async with self._index_lock:
+            current_time = time.time()
+            
+            # 尝试找到可用的 Key（距离上次调用至少1秒）
+            for _ in range(len(self.key_list)):
+                key = self.key_list[self.current_index]
+                last_call = self.last_call_times.get(key, 0)
+                elapsed = current_time - last_call
+                
+                if elapsed >= 1.0:
+                    # 这个 Key 可用，更新调用时间并返回
+                    self.last_call_times[key] = current_time
+                    self.current_index = (self.current_index + 1) % len(self.key_list)
+                    return key, self.key_locks[key]
+                
+                # 这个 Key 不可用，尝试下一个
+                self.current_index = (self.current_index + 1) % len(self.key_list)
+            
+            # 如果所有 Key 都不可用，等待最短的时间
+            if self.last_call_times:
+                wait_times = [1.0 - (current_time - last_call) 
+                            for last_call in self.last_call_times.values() 
+                            if (current_time - last_call) < 1.0]
+                if wait_times:
+                    min_wait = min(wait_times)
+                    if min_wait > 0:
+                        await asyncio.sleep(min_wait)
+                        current_time = time.time()
+            
+            # 再次尝试获取 Key（此时应该至少有一个可用）
+            key = self.key_list[self.current_index]
+            self.last_call_times[key] = current_time
+            self.current_index = (self.current_index + 1) % len(self.key_list)
+            return key, self.key_locks[key]
 
 
 def is_valid_solana_address(address: str) -> bool:
@@ -259,6 +351,8 @@ class BatchAnalyzerV2:
         self,
         analyzer: WalletAnalyzerV2,
         trash_manager: TrashListManager,
+        helius_key_manager: APIKeyManager,
+        jupiter_key_manager: APIKeyManager,
         concurrent_limit: int = CONCURRENT_LIMIT
     ):
         """
@@ -267,15 +361,18 @@ class BatchAnalyzerV2:
         Args:
             analyzer: 钱包分析器实例
             trash_manager: 黑名单管理器实例
+            helius_key_manager: Helius API Key 管理器
+            jupiter_key_manager: Jupiter API Key 管理器
             concurrent_limit: 数据处理并发限制（API调用始终串行）
         """
         self.analyzer = analyzer
         self.trash_manager = trash_manager
+        self.helius_key_manager = helius_key_manager
+        self.jupiter_key_manager = jupiter_key_manager
         self.concurrent_limit = concurrent_limit
         # 数据处理并发控制
         self.data_processing_semaphore = asyncio.Semaphore(concurrent_limit)
-        # API调用串行化锁（确保同一时间只有一个API调用）
-        self.api_lock = asyncio.Semaphore(1)
+        # 移除全局api_lock，改为每个Key独立的锁（允许3个Key并行）
     
     async def analyze_one_wallet(
         self,
@@ -297,49 +394,60 @@ class BatchAnalyzerV2:
             分析结果字典，如果失败或应过滤则返回 None
         """
         try:
-            # === 阶段1：API调用（串行化）===
-            # 使用 API 锁确保同一时间只有一个 API 调用
-            async with self.api_lock:
+            # === 阶段1：API调用（允许3个Key并行，但同一Key内部串行）===
+            # 获取可用的Helius Key和对应的锁（确保同一Key间隔1秒）
+            helius_key, helius_lock = await self.helius_key_manager.get_key_and_lock()
+            async with helius_lock:
                 # 1. 拉取交易数据（Helius API）
                 try:
-                    txs = await self.analyzer.fetch_history_pagination(session, address, max_txs)
+                    txs = await self.analyzer.fetch_history_pagination(
+                        session, address, max_txs, helius_api_key=helius_key
+                    )
+                except ValueError as e:
+                    # API Key 未配置等配置错误
+                    logger.error(f"配置错误: {e}")
+                    pbar.update(1)
+                    return None
+                except aiohttp.ClientError as e:
+                    # 网络错误（连接失败、超时等）
+                    logger.warning(f"网络错误获取钱包 {address[:8]}... 交易数据: {e}")
+                    pbar.update(1)
+                    return None
                 except Exception as e:
+                    # 其他未知错误
                     logger.warning(f"获取钱包 {address[:8]}... 交易数据失败: {e}")
                     pbar.update(1)
-                    # 即使失败也要等待，确保API调用间隔
-                    await asyncio.sleep(1.0)
+                    return None
+                
+                # 如果返回空列表，可能是地址不存在（404），加入黑名单
+                if txs == []:
+                    logger.info(f"地址不存在或无效: {address[:8]}...，加入黑名单")
+                    self.trash_manager.add(address)
+                    pbar.update(1)
                     return None
                 
                 # 优化：如果交易数量太少（<10笔），可能不值得分析，提前退出
                 if not txs or len(txs) < 10:
                     pbar.update(1)
-                    # 即使提前退出也要等待，确保API调用间隔
-                    await asyncio.sleep(1.0)
                     return None
-                
-                # Helius API调用完成后，等待1秒再调用Jupiter API
-                await asyncio.sleep(1.0)
-                
-                # 2. 解析代币项目（内部会调用 Jupiter API）
-                try:
-                    analysis_result = await self.analyzer.parse_token_projects(session, txs, address)
-                except Exception as e:
-                    logger.warning(f"解析钱包 {address[:8]}... 代币项目失败: {e}")
-                    pbar.update(1)
-                    # 即使失败也要等待，确保API调用间隔
-                    await asyncio.sleep(1.0)
-                    return None
-                
-                # 优化：如果有效项目太少，提前退出
-                results = analysis_result.get("results", [])
-                if not results or len(results) < 3:
-                    pbar.update(1)
-                    # 即使提前退出也要等待，确保API调用间隔
-                    await asyncio.sleep(1.0)
-                    return None
-                
-                # Jupiter API调用完成后，等待1秒（为下一个钱包的API调用做准备）
-                await asyncio.sleep(1.0)
+            
+            # 2. 解析代币项目（内部会调用 Jupiter API）
+            # 注意：Helius和Jupiter之间不需要间隔，只有同一API之间需要间隔
+            # Jupiter API 的 Key 会在 PriceFetcher 内部通过 key_manager 获取
+            try:
+                analysis_result = await self.analyzer.parse_token_projects(
+                    session, txs, address, jupiter_key_manager=self.jupiter_key_manager
+                )
+            except Exception as e:
+                logger.warning(f"解析钱包 {address[:8]}... 代币项目失败: {e}")
+                pbar.update(1)
+                return None
+            
+            # 优化：如果有效项目太少，提前退出
+            results = analysis_result.get("results", [])
+            if not results or len(results) < 3:
+                pbar.update(1)
+                return None
             
             # === 阶段2：数据处理（可以并发）===
             # 使用数据处理信号量控制并发数，但可以多个任务同时处理
@@ -370,6 +478,7 @@ class BatchAnalyzerV2:
                 
                 # 7. 计算基础指标
                 wins = [r for r in results if r.get('is_win', False)]
+                losses = [r for r in results if not r.get('is_win', False)]
                 win_rate = len(wins) / len(results) if results else 0
                 total_profit = profit_dim.get("total_profit", 0)
                 max_roi = profit_dim.get("max_roi", 0)
@@ -389,6 +498,9 @@ class BatchAnalyzerV2:
                 # 使用未结算部分的成本，而不是总买入成本
                 unsettled_cost = sum(r.get('unsettled_cost', 0) for r in unsettled_tokens)
                 unsettled_roi = (unsettled_profit / unsettled_cost - 1) if unsettled_cost > 0 else 0
+                
+                # 9. 计算单币亏损超过95%的数量
+                severe_loss_count = len([r for r in losses if r.get('roi', 0) <= -0.95])
                 
                 pbar.update(1)
                 return {
@@ -422,6 +534,7 @@ class BatchAnalyzerV2:
                     "未结算盈利(SOL)": round(unsettled_profit, 2),
                     "未结算ROI": f"{unsettled_roi:.1%}",
                     "未结算平均持仓(分钟)": round(unsettled_avg_hold_time, 1),
+                    "单币亏损>95%数量": severe_loss_count,
                     "分析时间": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "🛡️ 稳健中军": positioning.get("🛡️ 稳健中军", 0),
                     "⚔️ 土狗猎手": positioning.get("⚔️ 土狗猎手", 0),
@@ -437,38 +550,135 @@ class BatchAnalyzerV2:
     async def analyze_batch(
         self,
         addresses: List[str],
-        max_txs: int = 5000
+        max_txs: int = 5000,
+        save_interval: int = 20,
+        exporter: 'ReportExporterV2' = None
     ) -> List[Dict]:
         """
         批量分析钱包列表（生产者-消费者模式）
         
         设计：
         - 所有任务并发创建（生产者）
-        - API调用串行化（通过api_lock）
+        - API调用允许3个Key并行，但同一Key内部串行
         - 数据处理并发（通过data_processing_semaphore）
+        - 每处理N个钱包自动保存一次报告
         
         Args:
             addresses: 钱包地址列表
             max_txs: 每个钱包最大交易数量（默认5000，降低以提升速度）
+            save_interval: 每处理多少个钱包保存一次报告（默认20）
+            exporter: 报告导出器实例（用于定期保存）
             
         Returns:
             分析结果列表
         """
         pbar = tqdm(total=len(addresses), desc="📊 审计进度", unit="钱包", colour="green")
         
-        logger.info(f"开始分析 {len(addresses)} 个钱包（API调用串行，数据处理并发）...")
-        logger.info(f"提示：由于API调用串行化，处理速度较慢，请耐心等待...")
+        logger.info(f"开始分析 {len(addresses)} 个钱包（3个Key并行，数据处理并发）...")
+        logger.info(f"每成功分析 {save_interval} 个钱包自动保存一次报告（只统计成功的）")
+        
+        # 共享的结果列表和计数器（用于定期保存）
+        all_results: List[Dict] = []
+        completed_count = 0  # 成功分析的钱包数（只统计成功的）
+        results_lock = asyncio.Lock()
+        save_lock = asyncio.Lock()  # 保存操作的锁，确保同时只有一个保存任务
+        save_tasks: List[asyncio.Task] = []  # 所有保存任务列表
+        
+        # 确保 exporter 在闭包中可用
+        if exporter is None:
+            logger.warning("⚠️ exporter 为 None，中间报告保存功能将被禁用")
+        
+        async def save_report_async(results_to_save: List[Dict], count: int):
+            """
+            异步保存报告（不阻塞主流程）
+            
+            Args:
+                results_to_save: 要保存的结果列表（复制一份避免并发修改）
+                count: 当前完成数量
+            """
+            async with save_lock:
+                try:
+                    logger.info(f"🔄 开始保存中间报告 ({count} 个钱包，结果数: {len(results_to_save)})...")
+                    
+                    # 检查 exporter 是否存在
+                    if exporter is None:
+                        logger.error(f"❌ exporter 为 None，无法保存 ({count} 个钱包)")
+                        return
+                    
+                    # 直接调用 export 方法（不使用 run_in_executor，避免问题）
+                    # 因为 pandas 操作很快，不需要放到线程池
+                    try:
+                        temp_file = exporter.export(
+                            results_to_save.copy(),  # 复制一份避免并发修改
+                            RESULTS_DIR,
+                            True  # is_temp=True
+                        )
+                        if temp_file:
+                            abs_path = os.path.abspath(temp_file)
+                            # 检查文件是否真的存在
+                            if os.path.exists(temp_file):
+                                file_size = os.path.getsize(temp_file)
+                                logger.info(f"✅ 已保存中间报告: {abs_path} ({count} 个钱包，文件大小: {file_size} 字节)")
+                            else:
+                                logger.error(f"❌ 文件保存失败: 文件不存在 {abs_path}")
+                        else:
+                            logger.warning(f"⚠️ 保存中间报告返回 None ({count} 个钱包)")
+                    except Exception as export_error:
+                        logger.error(f"❌ 调用 exporter.export 失败 ({count} 个钱包): {export_error}", exc_info=True)
+                        raise
+                except Exception as e:
+                    logger.error(f"❌ 保存中间报告失败 ({count} 个钱包): {e}", exc_info=True)
         
         async def analyze_task(session, addr, index):
             """
             单个钱包分析任务（生产者）
-            内部会通过锁控制API调用串行，数据处理并发
+            内部会通过锁控制API调用（每个Key独立锁），数据处理并发
             """
+            nonlocal completed_count, save_tasks
             try:
                 result = await self.analyze_one_wallet(session, addr, pbar, max_txs)
-                # 每处理50个钱包输出一次日志
-                if (index + 1) % 50 == 0:
-                    logger.info(f"进度: {index + 1}/{len(addresses)} ({100*(index+1)/len(addresses):.1f}%)")
+                
+                if result is not None:
+                    should_save = False
+                    current_count = 0
+                    async with results_lock:
+                        all_results.append(result)
+                        completed_count += 1  # 只统计成功的
+                        current_count = completed_count  # 保存当前值，用于日志
+                        
+                        # 每成功分析N个钱包保存一次报告（异步，不阻塞）
+                        if completed_count % save_interval == 0:
+                            if exporter:
+                                should_save = True
+                                logger.info(f"📝 触发保存任务: 成功分析 {completed_count} 个钱包，结果数: {len(all_results)}")
+                            else:
+                                logger.warning(f"⚠️ exporter 为 None，无法保存中间报告 (成功分析 {completed_count} 个钱包)")
+                        
+                        # # 每成功分析10个钱包输出一次日志（更频繁，便于调试）
+                        # if completed_count % 10 == 0:
+                        #     logger.info(f"进度: 成功分析 {completed_count} 个钱包 ({100*completed_count/len(addresses):.1f}%)")
+
+                        # 每成功分析50个钱包输出一次详细日志
+                        if completed_count % 50 == 0:
+                            logger.info(f"详细进度: 成功分析 {completed_count} 个钱包，结果数: {len(all_results)}")
+                            
+                            # 清理价格缓存（每50个钱包清理一次）
+                            # 注意：这里需要访问analyzer的price_fetcher，但它是每个钱包独立的
+                            # 所以缓存清理在PriceFetcher内部自动进行
+                    
+                    # 异步保存（不阻塞主流程）
+                    if should_save:
+                        logger.info(f"🔄 创建保存任务: 成功分析 {current_count} 个钱包，结果数: {len(all_results)}")
+                        # 创建异步保存任务（不等待完成）
+                        try:
+                            task = asyncio.create_task(
+                                save_report_async(all_results.copy(), current_count)
+                            )
+                            save_tasks.append(task)
+                            logger.info(f"✅ 保存任务已创建，当前共有 {len(save_tasks)} 个保存任务")
+                        except Exception as task_error:
+                            logger.error(f"❌ 创建保存任务失败: {task_error}", exc_info=True)
+                
                 return result
             except Exception as e:
                 logger.error(f"处理钱包 {addr[:8]}... 时出错: {e}")
@@ -476,13 +686,12 @@ class BatchAnalyzerV2:
                 return None
         
         # 创建所有任务并发执行（生产者模式）
-        # API调用会在内部通过api_lock串行化
+        # API调用会在内部通过每个Key的独立锁控制（允许3个Key并行）
         # 数据处理可以通过data_processing_semaphore并发
         async with aiohttp.ClientSession() as session:
             tasks = [analyze_task(session, addr, i) for i, addr in enumerate(addresses)]
             raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-            # 过滤掉异常和None
-            results = []
+            # 过滤掉异常和None（结果已经在analyze_task中添加到all_results）
             exception_count = 0
             for r in raw_results:
                 if isinstance(r, Exception):
@@ -491,13 +700,15 @@ class BatchAnalyzerV2:
                         logger.error(f"任务执行异常: {r}")
             if exception_count > 5:
                 logger.warning(f"还有 {exception_count - 5} 个异常未显示")
-            
-            for r in raw_results:
-                if not isinstance(r, Exception) and r is not None:
-                    results.append(r)
+        
+        # 等待所有保存任务完成
+        if save_tasks:
+            logger.info(f"等待 {len(save_tasks)} 个保存任务完成...")
+            await asyncio.gather(*save_tasks, return_exceptions=True)
+            logger.info("所有保存任务已完成")
         
         pbar.close()
-        return results
+        return all_results
 
 
 class ReportExporterV2:
@@ -506,19 +717,20 @@ class ReportExporterV2:
     """
     
     @staticmethod
-    def export(results: List[Dict], output_dir: str = RESULTS_DIR) -> Optional[str]:
+    def export(results: List[Dict], output_dir: str = RESULTS_DIR, is_temp: bool = False) -> Optional[str]:
         """
         导出分析结果到 Excel
         
         Args:
             results: 分析结果列表
             output_dir: 输出目录
+            is_temp: 是否为临时文件（True则覆盖临时文件，False则创建新文件）
             
         Returns:
             输出文件路径，如果失败则返回 None
         """
         if not results:
-            logger.warning("没有结果可导出")
+            logger.warning(f"没有结果可导出 (results为空，长度: {len(results) if results else 0})")
             return None
         
         # 创建输出目录
@@ -537,6 +749,7 @@ class ReportExporterV2:
                 "平均持仓(分钟)", "盈利持仓(分钟)", "亏损持仓(分钟)",
                 "代币多样性", "30天代币数", "30天交易数", "7天代币数", "7天交易数",
                 "项目总数", "未结算token数", "未结算盈利(SOL)", "未结算ROI", "未结算平均持仓(分钟)",
+                "单币亏损>95%数量",
                 "🛡️ 稳健中军", "⚔️ 土狗猎手", "💎 钻石之手", "🚀 短线高手",
                 "分析时间"
             ]
@@ -546,10 +759,25 @@ class ReportExporterV2:
             remaining_cols = [col for col in df.columns if col not in available_cols]
             df = df[available_cols + remaining_cols]
             
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = os.path.join(output_dir, f"wallet_ranking_v2_{timestamp}.xlsx")
+            if is_temp:
+                # 临时文件：覆盖同一个文件
+                output_file = os.path.join(output_dir, "wallet_ranking_v2_temp.xlsx")
+            else:
+                # 最终文件：创建新文件
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_file = os.path.join(output_dir, f"wallet_ranking_v2_{timestamp}.xlsx")
+            
             df.to_excel(output_file, index=False, engine='openpyxl')
-            logger.info(f"导出成功: {output_file} ({len(results)} 条记录)")
+            abs_path = os.path.abspath(output_file)
+            
+            # 验证文件是否真的创建成功
+            if os.path.exists(output_file):
+                file_size = os.path.getsize(output_file)
+                logger.info(f"✅ 导出成功: {abs_path} ({len(results)} 条记录，文件大小: {file_size} 字节)")
+            else:
+                logger.error(f"❌ 文件保存失败: 文件不存在 {abs_path}")
+                return None
+            
             return output_file
         except Exception as e:
             logger.error(f"导出失败: {e}")
@@ -558,10 +786,35 @@ class ReportExporterV2:
 
 async def main():
     """主函数：批量分析入口"""
+    # 检查 API Key 配置
+    helius_keys = [k for k in HELIUS_KEY_LIST if k and k.strip()]
+    jupiter_keys = [k for k in JUPITER_KEY_LIST if k and k.strip()]
+    
+    if not helius_keys:
+        print("❌ 错误：HELIUS_KEY_LIST 未配置，请在文件开头添加你的 Helius API Keys")
+        return
+    
+    if not jupiter_keys:
+        print("❌ 错误：JUPITER_KEY_LIST 未配置，请在文件开头添加你的 Jupiter API Keys")
+        return
+    
+    # 初始化 API Key 管理器
+    helius_key_manager = APIKeyManager(helius_keys, "Helius")
+    jupiter_key_manager = APIKeyManager(jupiter_keys, "Jupiter")
+    
+    logger.info(f"已配置 {len(helius_keys)} 个 Helius API Keys")
+    logger.info(f"已配置 {len(jupiter_keys)} 个 Jupiter API Keys")
+    
     # 初始化组件
-    analyzer = WalletAnalyzerV2()
+    analyzer = WalletAnalyzerV2()  # 不需要传入key，因为会在调用时动态获取
     trash_manager = TrashListManager()
-    batch_analyzer = BatchAnalyzerV2(analyzer, trash_manager, CONCURRENT_LIMIT)
+    batch_analyzer = BatchAnalyzerV2(
+        analyzer, 
+        trash_manager, 
+        helius_key_manager,
+        jupiter_key_manager,
+        CONCURRENT_LIMIT
+    )
     exporter = ReportExporterV2()
     
     # 加载钱包列表和黑名单
@@ -582,12 +835,22 @@ async def main():
     
     print(f"🚀 启动批量分析 V2 (超严格版) | 任务数: {len(addresses)} (跳过黑名单: {skip_count})")
     
-    # 执行批量分析
-    results = await batch_analyzer.analyze_batch(addresses)
+    # 执行批量分析（每20个钱包自动保存一次）
+    results = await batch_analyzer.analyze_batch(addresses, save_interval=20, exporter=exporter)
     
-    # 导出结果
+    # 导出最终结果（覆盖临时文件或创建新文件）
     if results:
-        output_file = exporter.export(results)
+        # 删除临时文件（如果存在）
+        temp_file = os.path.join(RESULTS_DIR, "wallet_ranking_v2_temp.xlsx")
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+                logger.debug(f"已删除临时文件: {temp_file}")
+            except Exception as e:
+                logger.warning(f"删除临时文件失败: {e}")
+        
+        # 导出最终报告
+        output_file = exporter.export(results, is_temp=False)
         if output_file:
             print(f"\n✅ 导出成功: {output_file}")
             print(f"📊 共分析 {len(results)} 个钱包，已按综合评分排序")
