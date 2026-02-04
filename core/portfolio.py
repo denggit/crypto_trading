@@ -903,10 +903,11 @@ class PortfolioManager:
             "sell_count": sum(1 for x in history_snapshot if 'SELL' in x['action'])
         }
 
-    async def send_daily_summary(self):
+async def send_daily_summary(self):
         logger.info("📊 正在生成每日日报...")
         async with aiohttp.ClientSession(trust_env=True) as session:
             try:
+                # 1. 获取基础价格
                 usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
                 quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
                 sol_price = float(quote['outAmount']) / 10 ** 6 if quote else 0
@@ -914,20 +915,49 @@ class PortfolioManager:
                 balance_resp = await self.trader.rpc_client.get_balance(self.trader.payer.pubkey())
                 sol_balance = balance_resp.value / 10 ** 9
 
-                holdings_val_sol = 0
+                # 2. 计算持仓数据 (市值、成本、浮盈、胜负)
+                holdings_val_sol = 0.0
+                holdings_cost_sol = 0.0
+                holding_wins = 0
+                holding_losses = 0
+                holdings_count = 0
                 holdings_details = ""
+
                 if self.portfolio:
                     for mint, data in self.portfolio.items():
                         qty = data['my_balance']
+                        cost = data['cost_sol']
                         if qty > 0:
+                            holdings_count += 1
+                            # 询价
                             q = await self.trader.get_quote(session, mint, self.trader.SOL_MINT, qty)
                             val = int(q['outAmount']) / 10 ** 9 if q else 0
+                            
+                            # 累加数据
                             holdings_val_sol += val
-                            holdings_details += f"- {mint[:6]}...: 持有 {qty}, 价值 {val:.2f} SOL\n"
+                            holdings_cost_sol += cost
+                            
+                            # 单个持仓盈亏判定
+                            pnl = val - cost
+                            pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+                            
+                            if pnl > 0:
+                                holding_wins += 1
+                                icon = "🔴" # 涨 (红/绿根据习惯，这里用红代表涨)
+                            else:
+                                holding_losses += 1
+                                icon = "🟢" # 跌
+                                
+                            holdings_details += f"{icon} {mint[:4]}..: {val:.3f} SOL ({pnl_pct:+.1f}%)\n"
 
+                # 计算浮动盈亏 (Unrealized PnL)
+                unrealized_pnl_sol = holdings_val_sol - holdings_cost_sol
+
+                # 总资产
                 total_asset_sol = sol_balance + holdings_val_sol
                 total_asset_usd = total_asset_sol * sol_price
 
+                # 3. 获取历史已结数据
                 yesterday = datetime.now() - timedelta(days=1)
                 history_snapshot = list(self.trade_history)
                 loop = asyncio.get_event_loop()
@@ -938,47 +968,45 @@ class PortfolioManager:
                     yesterday
                 )
 
-                daily_profit_sol = stats["daily_profit_sol"]
-                total_realized_profit_sol = stats["total_realized_profit_sol"]
-                daily_wins = stats["daily_wins"]
-                daily_losses = stats["daily_losses"]
-                total_wins = stats["total_wins"]
-                total_losses = stats["total_losses"]
+                # 4. 合并数据 (历史 + 持仓)
+                # 真实盈亏 = 已结盈亏 + 浮动盈亏
+                total_net_pnl_sol = stats["total_realized_profit_sol"] + unrealized_pnl_sol
+                total_net_pnl_usd = total_net_pnl_sol * sol_price
 
-                daily_total = daily_wins + daily_losses
-                daily_win_rate = (daily_wins / daily_total * 100) if daily_total > 0 else 0.0
-                total_valid = total_wins + total_losses
-                total_win_rate = (total_wins / total_valid * 100) if total_valid > 0 else 0.0
-                total_profit_usd = total_realized_profit_sol * sol_price
+                # 综合胜率 = (历史胜单 + 持仓胜单) / (历史总单 + 持仓总数)
+                combined_wins = stats["total_wins"] + holding_wins
+                combined_losses = stats["total_losses"] + holding_losses
+                combined_total = combined_wins + combined_losses
+                combined_win_rate = (combined_wins / combined_total * 100) if combined_total > 0 else 0.0
 
+                # 5. 生成报告
                 report = f"""
-【📅 每日交易与资产报告】
+【📅 每日资产与盈亏全景】
 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-💰 资产概览:
+💰 资产总览 (Mark-To-Market):
 -------------------
-• SOL 价格: ${sol_price:.2f}
+• SOL 价格：${sol_price}
 • 钱包余额: {sol_balance:.4f} SOL
-• 持仓价值: {holdings_val_sol:.4f} SOL
-• 总计资产: {total_asset_sol:.4f} SOL (≈ ${total_asset_usd:.2f})
+• 持仓市值: {holdings_val_sol:.4f} SOL
+• 资产总值: {total_asset_sol:.4f} SOL (≈ ${total_asset_usd:.0f})
 
-📈 战绩统计 (去灰尘版):
+📊 盈亏分析 (含持仓):
 -------------------
-• 今日已结盈亏: {'+' if daily_profit_sol >= 0 else ''}{daily_profit_sol:.4f} SOL
-• 今日有效胜率: {daily_win_rate:.1f}% ({daily_wins} 胜 / {daily_losses} 负)
+• 历史已结盈亏: {stats['total_realized_profit_sol']:+.4f} SOL
+• 当前浮动盈亏: {unrealized_pnl_sol:+.4f} SOL
+• 账户净盈亏:   {total_net_pnl_sol:+.4f} SOL 🔥
 
-🏆 历史累计数据:
+🏆 综合胜率 (含持仓):
 -------------------
-• 累计已结盈亏: {'+' if total_realized_profit_sol >= 0 else ''}{total_realized_profit_sol:.4f} SOL (≈ ${total_profit_usd:.2f})
-• 累计有效胜率: {total_win_rate:.1f}% ({total_wins} 胜 / {total_losses} 负)
-• 累计交易笔数: {stats['sell_count']} (含灰尘)
+• 综合胜率: {combined_win_rate:.1f}% 
+  (共 {combined_total} 局: {combined_wins} 胜 / {combined_losses} 负)
+  *包含 {stats['sell_count']} 笔历史卖出 + {holdings_count} 个当前持仓
 
-👜 当前持仓明细:
+👜 持仓明细 ({holdings_count} 个):
 {holdings_details if holdings_details else "(空仓)"}
-
-🤖 机器人状态: 正常运行中 (零阻塞模式)
 """
-                await send_email_async("📊 [日报] 资产与盈亏统计", report, attachment_path=PORTFOLIO_FILE)
+                await send_email_async("📊 [日报] 资产净值与持仓透视", report, attachment_path=PORTFOLIO_FILE)
                 logger.info("✅ 日报已发送")
 
             except Exception as e:
