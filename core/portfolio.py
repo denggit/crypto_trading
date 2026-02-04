@@ -943,10 +943,10 @@ async def send_daily_summary(self):
                             
                             if pnl > 0:
                                 holding_wins += 1
-                                icon = "🔴" # 涨 (红/绿根据习惯，这里用红代表涨)
+                                icon = "🟢" # 涨 (红/绿根据习惯，这里用绿代表涨)
                             else:
                                 holding_losses += 1
-                                icon = "🟢" # 跌
+                                icon = "🔴" # 跌
                                 
                             holdings_details += f"{icon} {mint[:4]}..: {val:.3f} SOL ({pnl_pct:+.1f}%)\n"
 
