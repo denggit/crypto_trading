@@ -404,6 +404,12 @@ class PortfolioManager:
             remaining_balance = self.portfolio[token_mint]['my_balance']
             if remaining_balance < 100:
                 del self.portfolio[token_mint]
+                # 🔥 新增：重置该代币的交易计数，防止影响下一次波段
+                if token_mint in self.sell_counts_cache:
+                    del self.sell_counts_cache[token_mint]
+                # 买入计数看你策略，通常也可以重置
+                if token_mint in self.buy_counts_cache:
+                    del self.buy_counts_cache[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕（成本已归零）")
                 logger.info(f"🧹 正在尝试回收账户租金...")
                 await asyncio.sleep(2)
