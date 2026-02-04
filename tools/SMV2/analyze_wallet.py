@@ -31,7 +31,7 @@ from config.settings import HELIUS_API_KEY, JUPITER_API_KEY
 
 # === ⚙️ 基础配置 ===
 TARGET_TX_COUNT = 2000
-JUPITER_QUOTE_TIMEOUT = 5  # 降低超时时间以提升速度
+JUPITER_QUOTE_TIMEOUT = 3  # 降低超时时间以提升速度（从5秒降到3秒）
 JUPITER_MAX_RETRIES = 1  # 减少重试次数以提升速度
 MIN_COST_THRESHOLD = 0.05  # 最小成本阈值
 DUST_THRESHOLD = 0.01  # 粉尘阈值：未实现收益低于此值的代币视为粉尘
@@ -431,6 +431,12 @@ class PriceFetcher:
                 uncached_mints.append(mint)
 
         # 只对未缓存的代币进行API查询（串行，因为API不能并发）
+        # 添加超时保护：如果代币太多，限制查询时间
+        max_price_queries = 30  # 最多查询30个代币的价格（减少以提升速度）
+        if len(uncached_mints) > max_price_queries:
+            logger.info(f"未缓存代币过多({len(uncached_mints)}个)，仅查询前{max_price_queries}个以提升速度")
+            uncached_mints = uncached_mints[:max_price_queries]
+        
         for i, mint in enumerate(uncached_mints):
             try:
                 result = await self._get_single_token_price_sol(mint, max_retries)
@@ -568,9 +574,9 @@ class WalletAnalyzerV2:
         self.db_manager = db_manager
     
     async def fetch_history_pagination(
-            self,
-            session: aiohttp.ClientSession,
-            address: str,
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
             max_count: int = 3000,
             helius_api_key=None
     ) -> List[dict]:
@@ -643,8 +649,8 @@ class WalletAnalyzerV2:
             while len(new_txs) < max_count:
                 url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
                 params = {
-                    "api-key": helius_api_key,
-                    "limit": page_size
+                            "api-key": helius_api_key,
+                            "limit": page_size
                 }
                 if last_signature:
                     params["before"] = last_signature
@@ -686,19 +692,19 @@ class WalletAnalyzerV2:
                                 page_overlap = True
                                 overlap_found = True
                                 break
-                        
+
                         # 添加新交易（去重）
                         for tx in data:
                             sig = tx.get('signature')
                             if sig and sig not in cached_signatures:
                                 new_txs.append(tx)
                                 cached_signatures.add(sig)
-                        
+
                         # 如果发现重叠，说明最新数据已经拉够了
                         if page_overlap:
                             logger.debug(f"发现重叠，停止拉取新数据: {address[:8]}... (已拉取 {len(new_txs)} 条新交易)")
                             break
-                        
+
                         if len(data) < page_size:
                             break
 
@@ -951,10 +957,11 @@ class WalletAnalyzerV2:
             if (v["buy_tokens"] - v["sell_tokens"]) > 0 and v["buy_sol"] >= MIN_COST_THRESHOLD
         ]
         
-        # 优化：如果持仓代币太多，只查询前50个（避免查询时间过长）
-        if len(active_mints) > 50:
-            logger.debug(f"持仓代币过多({len(active_mints)}个)，仅查询前50个的价格")
-            active_mints = active_mints[:50]
+        # 优化：如果持仓代币太多，只查询前30个（避免查询时间过长）
+        # 减少到30个以提升速度，因为每个代币查询需要3秒超时
+        if len(active_mints) > 30:
+            logger.info(f"持仓代币过多({len(active_mints)}个)，仅查询前30个的价格以提升速度")
+            active_mints = active_mints[:30]
 
         if active_mints:
             logger.debug(f"正在获取 {len(active_mints)} 个代币的 SOL 价格...")
@@ -1522,13 +1529,17 @@ class WalletScorerV2:
             flags["is_trash"] = True
             flags["reasons"].append(f"交易{unique_tokens}个代币但仍亏损 {total_profit:.2f} SOL")
 
-        # 5. 超过两个代币交易亏损<=-95%
-        if unique_tokens > 2:
+        # 5. 亏损>95%的代币占比总交易代币数大于10%
+        if unique_tokens > 0:
             # 统计亏损<=-95%的代币数量
             severe_losses = [r for r in losses if r.get('roi', 0) <= -0.95]
-            if len(severe_losses) >= 2:
+            severe_loss_count = len(severe_losses)
+            # 计算占比
+            severe_loss_ratio = severe_loss_count / unique_tokens if unique_tokens > 0 else 0
+            # 如果占比 > 10%，则认为是垃圾地址
+            if severe_loss_ratio > 0.10:
                 flags["is_trash"] = True
-                flags["reasons"].append(f"有{len(severe_losses)}个代币亏损<=-95%")
+                flags["reasons"].append(f"亏损>95%的代币占比{severe_loss_ratio:.1%}({severe_loss_count}/{unique_tokens})超过10%")
 
         # 6. 交易超过5个代币，盈亏比小于1
         if unique_tokens > 5 and profit_factor < 1.0:

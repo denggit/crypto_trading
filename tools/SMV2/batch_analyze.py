@@ -618,8 +618,6 @@ class BatchAnalyzerV2:
             """
             async with save_lock:
                 try:
-                    logger.info(f"🔄 开始保存中间报告 ({count} 个钱包，结果数: {len(results_to_save)})...")
-
                     # 检查 exporter 是否存在
                     if exporter is None:
                         logger.error(f"❌ exporter 为 None，无法保存 ({count} 个钱包)")
@@ -636,10 +634,7 @@ class BatchAnalyzerV2:
                         if temp_file:
                             abs_path = os.path.abspath(temp_file)
                             # 检查文件是否真的存在
-                            if os.path.exists(temp_file):
-                                file_size = os.path.getsize(temp_file)
-                                logger.info(f"✅ 已保存中间报告: {abs_path} ({count} 个钱包，文件大小: {file_size} 字节)")
-                            else:
+                            if not os.path.exists(temp_file):
                                 logger.error(f"❌ 文件保存失败: 文件不存在 {abs_path}")
                         else:
                             logger.warning(f"⚠️ 保存中间报告返回 None ({count} 个钱包)")
@@ -670,23 +665,9 @@ class BatchAnalyzerV2:
                         if completed_count % save_interval == 0:
                             if exporter:
                                 should_save = True
-                                logger.info(
-                                    f"📝 触发保存任务: 成功分析 {completed_count} 个钱包，结果数: {len(all_results)}")
                             else:
                                 logger.warning(
                                     f"⚠️ exporter 为 None，无法保存中间报告 (成功分析 {completed_count} 个钱包)")
-
-                        # # 每成功分析10个钱包输出一次日志（更频繁，便于调试）
-                        # if completed_count % 10 == 0:
-                        #     logger.info(f"进度: 成功分析 {completed_count} 个钱包 ({100*completed_count/len(addresses):.1f}%)")
-
-                        # 每成功分析50个钱包输出一次详细日志
-                        if completed_count % 50 == 0:
-                            logger.info(f"详细进度: 成功分析 {completed_count} 个钱包，结果数: {len(all_results)}")
-
-                            # 清理价格缓存（每50个钱包清理一次）
-                            # 注意：这里需要访问analyzer的price_fetcher，但它是每个钱包独立的
-                            # 所以缓存清理在PriceFetcher内部自动进行
 
                     # 异步保存（不阻塞主流程）
                     if should_save:
@@ -697,7 +678,6 @@ class BatchAnalyzerV2:
                                 save_report_async(all_results.copy(), current_count)
                             )
                             save_tasks.append(task)
-                            logger.info(f"✅ 保存任务已创建，当前共有 {len(save_tasks)} 个保存任务")
                         except Exception as task_error:
                             logger.error(f"❌ 创建保存任务失败: {task_error}", exc_info=True)
 
