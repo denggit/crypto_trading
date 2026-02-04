@@ -161,7 +161,7 @@ class TransactionDBManager:
     
     def save_transactions(self, address: str, transactions: List[dict]):
         """
-        保存交易记录到数据库（去重）
+        保存交易记录到数据库（去重，支持并发安全）
         
         Args:
             address: 钱包地址
@@ -173,7 +173,7 @@ class TransactionDBManager:
         try:
             conn = duckdb.connect(str(self.db_file))
             
-            # 获取已有的signature集合
+            # 获取已有的signature集合（用于本地去重，减少不必要的插入尝试）
             existing_sigs = set()
             result = conn.execute(
                 "SELECT signature FROM transactions WHERE address = ?",
@@ -181,7 +181,7 @@ class TransactionDBManager:
             ).fetchall()
             existing_sigs = {row[0] for row in result}
             
-            # 插入新交易（去重）
+            # 插入新交易（使用 INSERT OR IGNORE 处理并发插入时的重复键冲突）
             new_count = 0
             for tx in transactions:
                 signature = tx.get('signature')
@@ -190,14 +190,19 @@ class TransactionDBManager:
                 
                 try:
                     tx_json = json.dumps(tx, ensure_ascii=False) if not isinstance(tx, str) else tx
+                    # 使用 INSERT OR IGNORE 避免并发插入时的重复键冲突
+                    # 如果记录已存在，则忽略插入（不报错）
                     conn.execute(
-                        "INSERT INTO transactions (address, signature, transaction_data) VALUES (?, ?, ?)",
+                        "INSERT OR IGNORE INTO transactions (address, signature, transaction_data) VALUES (?, ?, ?)",
                         [address, signature, tx_json]
                     )
                     existing_sigs.add(signature)
                     new_count += 1
                 except Exception as e:
-                    logger.warning(f"插入交易记录失败 {signature[:8]}...: {e}")
+                    # 如果 INSERT OR IGNORE 仍然失败（可能是其他错误），记录日志但不中断流程
+                    # 注意：在并发场景下，即使使用 INSERT OR IGNORE，也可能因为其他原因失败
+                    # 但这种情况应该很少见
+                    logger.debug(f"插入交易记录失败 {signature[:8]}...: {e}")
                     continue
             
             conn.commit()
@@ -263,7 +268,18 @@ class TransactionParser:
         Returns:
             (sol_change, token_changes, timestamp): SOL 净变动、代币变动字典、时间戳
         """
-        timestamp = tx.get('timestamp', 0)
+        # 获取时间戳，Helius API 返回的是 Unix 时间戳（秒）
+        # 注意：Helius API 可能返回秒或毫秒格式，需要检查
+        # 如果值很大（>1e10），可能是毫秒格式，需要转换
+        timestamp_raw = tx.get('timestamp', 0)
+        
+        # 检查时间戳格式
+        # Unix 时间戳（秒）通常在 1e9 到 1e10 之间（2001-2286年）
+        # 如果 > 1e10，很可能是毫秒格式
+        if timestamp_raw > 1e10:  # 可能是毫秒格式
+            timestamp = int(timestamp_raw / 1000)
+        else:
+            timestamp = int(timestamp_raw)
         native_sol_change = 0.0
         wsol_change = 0.0
         token_changes = defaultdict(float)
@@ -602,13 +618,13 @@ class WalletAnalyzerV2:
                     
                     # 如果最新交易在24小时内，且数据量足够，则不需要拉取新数据
                     if time_diff < 86400 and len(cached_txs) >= max_count:
-                        logger.info(f"缓存数据足够新（{hours_ago:.1f}小时前）且数量足够（{len(cached_txs)}条），跳过Helius API调用: {address[:8]}...")
+                        # logger.info(f"缓存数据足够新（{hours_ago:.1f}小时前）且数量足够（{len(cached_txs)}条），跳过Helius API调用: {address[:8]}...")
                         need_fetch_new = False
                     elif time_diff < 86400 and len(cached_txs) < max_count:
-                        logger.info(f"缓存数据足够新（{hours_ago:.1f}小时前）但数量不足（{len(cached_txs)}/{max_count}），需要向后拉取更老的数据: {address[:8]}...")
+                        # logger.info(f"缓存数据足够新（{hours_ago:.1f}小时前）但数量不足（{len(cached_txs)}/{max_count}），需要向后拉取更老的数据: {address[:8]}...")
                         need_fetch_new = False  # 不需要拉取新数据，只需要向后拉取
-                    else:
-                        logger.debug(f"缓存数据较旧（{hours_ago:.1f}小时前），需要拉取最新数据: {address[:8]}...")
+                    # else:
+                        # logger.debug(f"缓存数据较旧（{hours_ago:.1f}小时前），需要拉取最新数据: {address[:8]}...")
         
         # 2. 逐页拉取Helius最新数据（如果需要）
         new_txs = []
@@ -814,19 +830,24 @@ class WalletAnalyzerV2:
         attribution_calc = TokenAttributionCalculator()
         price_fetcher = PriceFetcher(session)
         
-        # 项目数据：{mint: {buy_sol, sell_sol, buy_tokens, sell_tokens, first_time, last_time, transactions}}
+        # 项目数据：{mint: {buy_sol, sell_sol, buy_tokens, sell_tokens, hold_periods, transactions}}
+        # hold_periods: 持仓周期列表，每个周期包含 [start_time, end_time]
+        # 用于正确计算持仓时间（同一代币可能有多个交易周期）
         projects = defaultdict(lambda: {
             "buy_sol": 0.0,
             "sell_sol": 0.0,
             "buy_tokens": 0.0,
             "sell_tokens": 0.0,
-            "first_time": 0,
-            "last_time": 0,
+            "hold_periods": [],  # 持仓周期列表：[[start_time, end_time], ...]
+            "current_position": 0.0,  # 当前持仓数量
+            "current_period_start": 0,  # 当前持仓周期的开始时间
             "transactions": []  # 记录每笔交易的详细信息
         })
         
-        # 按时间倒序处理交易（从最早到最新）
-        for tx in reversed(transactions):
+        # 按时间正序处理交易（从最早到最新），这样才能正确跟踪持仓状态
+        # 注意：transactions 可能是倒序的（最新的在前），需要先排序
+        sorted_transactions = sorted(transactions, key=lambda x: x.get('timestamp', 0))
+        for tx in sorted_transactions:
             # 1. 快速过滤：如果这笔交易在 API 层面就没有 tokenTransfers 且没有 nativeTransfers，直接跳过
             if not tx.get('tokenTransfers') and not tx.get('nativeTransfers'):
                 continue
@@ -842,6 +863,10 @@ class WalletAnalyzerV2:
                 
                 # 更新项目数据
                 for mint, delta in token_changes.items():
+                    # 跳过 delta 为 0 的情况（同一笔交易中买入和卖出数量相等）
+                    if abs(delta) < 1e-9:
+                        continue
+                    
                     # 更新代币数量
                     if delta > 0:
                         projects[mint]["buy_tokens"] += delta
@@ -854,11 +879,29 @@ class WalletAnalyzerV2:
                     if mint in sell_attributions:
                         projects[mint]["sell_sol"] += sell_attributions[mint]
                     
-                    # 更新时间戳
-                    if projects[mint]["first_time"] == 0 and timestamp > 0:
-                        projects[mint]["first_time"] = timestamp
-                    if timestamp > 0:
-                        projects[mint]["last_time"] = timestamp
+                    # 跟踪持仓周期（用于正确计算持仓时间）
+                    prev_position = projects[mint]["current_position"]
+                    new_position = prev_position + delta
+                    projects[mint]["current_position"] = new_position
+                    
+                    # 如果持仓从0变为>0，开始新的持仓周期
+                    if prev_position == 0 and new_position > 0 and timestamp > 0:
+                        projects[mint]["current_period_start"] = timestamp
+                    
+                    # 如果持仓从>0变为0，结束当前持仓周期
+                    elif prev_position > 0 and new_position == 0 and timestamp > 0:
+                        period_start = projects[mint]["current_period_start"]
+                        if period_start > 0:
+                            # 如果开始时间和结束时间相同（同一笔交易中买入并卖出），至少记录1秒的持仓时间
+                            end_time = timestamp
+                            if end_time <= period_start:
+                                end_time = period_start + 1  # 至少1秒
+                            projects[mint]["hold_periods"].append([period_start, end_time])
+                            projects[mint]["current_period_start"] = 0
+                    
+                    # 特殊情况：如果同一笔交易中同时买入和卖出（delta 可能很小但不为0）
+                    # 这种情况下，如果持仓从0变为>0再变为0，需要特殊处理
+                    # 但这种情况已经在上面处理了，因为我们会先处理买入（delta > 0），再处理卖出（delta < 0）
                     
                     # 记录交易详情
                     projects[mint]["transactions"].append({
@@ -870,12 +913,33 @@ class WalletAnalyzerV2:
                     })
                 
                 # 处理无 SOL 交易的跨代币兑换
+                # 注意：跨代币兑换也需要更新持仓周期
                 if abs(sol_change) < 1e-9 and token_changes:
                     for mint, delta in token_changes.items():
                         if delta > 0:
                             projects[mint]["buy_tokens"] += delta
                         else:
                             projects[mint]["sell_tokens"] += abs(delta)
+                        
+                        # 跟踪持仓周期（与上面相同的逻辑）
+                        prev_position = projects[mint]["current_position"]
+                        new_position = prev_position + delta
+                        projects[mint]["current_position"] = new_position
+                        
+                        # 如果持仓从0变为>0，开始新的持仓周期
+                        if prev_position == 0 and new_position > 0 and timestamp > 0:
+                            projects[mint]["current_period_start"] = timestamp
+                        
+                        # 如果持仓从>0变为0，结束当前持仓周期
+                        elif prev_position > 0 and new_position == 0 and timestamp > 0:
+                            period_start = projects[mint]["current_period_start"]
+                            if period_start > 0:
+                                # 如果开始时间和结束时间相同（同一笔交易中买入并卖出），至少记录1秒的持仓时间
+                                end_time = timestamp
+                                if end_time <= period_start:
+                                    end_time = period_start + 1  # 至少1秒
+                                projects[mint]["hold_periods"].append([period_start, end_time])
+                                projects[mint]["current_period_start"] = 0
                             
             except Exception as e:
                 logger.warning(f"Error parsing transaction: {e}")
@@ -917,10 +981,88 @@ class WalletAnalyzerV2:
             net_profit = total_value_sol - data["buy_sol"]
             roi = (total_value_sol / data["buy_sol"] - 1) if data["buy_sol"] > 0 else 0
             
-            # 计算持仓时间
-            hold_time_minutes = 0
-            if data["last_time"] > 0 and data["first_time"] > 0:
-                hold_time_minutes = (data["last_time"] - data["first_time"]) / 60
+            # 计算持仓时间（累加所有持仓周期的时间）
+            hold_time_minutes = 0.0
+            hold_periods = data.get("hold_periods", [])
+            current_period_start = data.get("current_period_start", 0)
+            current_position = data.get("current_position", 0)
+            
+            # 累加已完成的持仓周期
+            for period_start, period_end in hold_periods:
+                if period_start > 0 and period_end > 0:
+                    hold_time_minutes += (period_end - period_start) / 60
+            
+            # 如果有未完成的持仓周期（当前仍有持仓），使用当前时间作为结束时间
+            if current_period_start > 0 and remaining_tokens > 0:
+                current_time = datetime.now().timestamp()
+                hold_time_minutes += (current_time - current_period_start) / 60
+            
+            # 特殊情况：如果代币已经清仓（remaining_tokens == 0），但还有未记录的持仓周期
+            # 这可能发生在最后一笔交易清仓时，current_period_start 还没有被记录到 hold_periods
+            if remaining_tokens == 0 and current_period_start > 0:
+                # 从交易记录中找到最后一笔交易的时间作为结束时间
+                if data.get("transactions"):
+                    last_tx_time = max(tx.get("timestamp", 0) for tx in data["transactions"])
+                    if last_tx_time >= current_period_start:  # 使用 >= 而不是 >，允许相同时间
+                        # 如果开始时间和结束时间相同，至少记录1秒的持仓时间
+                        end_time = last_tx_time
+                        if end_time <= current_period_start:
+                            end_time = current_period_start + 1  # 至少1秒
+                        hold_time_minutes += (end_time - current_period_start) / 60
+                        # 也添加到 hold_periods 以便计算 first_time 和 last_time
+                        hold_periods.append([current_period_start, end_time])
+                        # 清空 current_period_start，因为已经记录到 hold_periods 了
+                        current_period_start = 0
+            
+            # 如果持仓时间为0，但代币有交易记录，说明可能是同一笔交易中买入并卖出
+            # 这种情况下，至少应该记录一个很小的持仓时间（比如1秒）
+            if hold_time_minutes == 0 and data.get("transactions") and len(data["transactions"]) > 0:
+                # 检查是否有买入和卖出
+                has_buy = any(tx.get("token_delta", 0) > 0 for tx in data["transactions"])
+                has_sell = any(tx.get("token_delta", 0) < 0 for tx in data["transactions"])
+                if has_buy and has_sell:
+                    # 同一代币有买入和卖出，至少记录1秒的持仓时间
+                    tx_times = [tx.get("timestamp", 0) for tx in data["transactions"] if tx.get("timestamp", 0) > 0]
+                    if tx_times:
+                        min_time = min(tx_times)
+                        max_time = max(tx_times)
+                        if max_time > min_time:
+                            hold_time_minutes = (max_time - min_time) / 60
+                        else:
+                            hold_time_minutes = 1.0 / 60  # 至少1秒
+                        # 也添加到 hold_periods
+                        if not hold_periods:
+                            hold_periods.append([min_time, max_time if max_time > min_time else min_time + 1])
+            
+            # 为了兼容性，保留 first_time 和 last_time（用于时间窗口分析）
+            first_time = 0
+            last_time = 0
+            if hold_periods:
+                first_time = min(period[0] for period in hold_periods)
+                last_time = max(period[1] for period in hold_periods)
+            if current_period_start > 0 and remaining_tokens > 0:
+                if first_time == 0 or current_period_start < first_time:
+                    first_time = current_period_start
+                current_time = datetime.now().timestamp()
+                if last_time == 0 or current_time > last_time:
+                    last_time = current_time
+            
+            # 如果所有持仓周期都已结束，但从交易记录中获取时间范围（作为后备方案）
+            # 这确保 first_time 和 last_time 总是有值（用于时间窗口分析）
+            if data.get("transactions"):
+                tx_times = [tx.get("timestamp", 0) for tx in data["transactions"] if tx.get("timestamp", 0) > 0]
+                if tx_times:
+                    tx_first = min(tx_times)
+                    tx_last = max(tx_times)
+                    # 如果 first_time 或 last_time 为 0，使用交易记录中的时间
+                    if first_time == 0:
+                        first_time = tx_first
+                    elif tx_first < first_time:
+                        first_time = tx_first  # 使用更早的时间
+                    if last_time == 0:
+                        last_time = tx_last
+                    elif tx_last > last_time:
+                        last_time = tx_last  # 使用更晚的时间
             
             # 计算未结算部分的成本（按比例分配）
             unsettled_cost = 0.0
@@ -934,8 +1076,8 @@ class WalletAnalyzerV2:
                 "roi": roi,
                 "is_win": net_profit > 0,
                 "hold_time": hold_time_minutes,
-                "first_time": data["first_time"],
-                "last_time": data["last_time"],
+                "first_time": first_time,  # 使用计算出的 first_time
+                "last_time": last_time,  # 使用计算出的 last_time
                 "transactions": data["transactions"],
                 "has_price": price_sol > 0,
                 "remaining_tokens": remaining_tokens,  # 剩余代币数量

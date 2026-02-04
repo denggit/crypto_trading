@@ -23,17 +23,12 @@ import aiohttp
 import pandas as pd
 from tqdm.asyncio import tqdm
 
-from tools.SMV2.key_list import HELIUS_KEY_LIST, JUPITER_KEY_LIST
-
 # 确保能找到 analyze_wallet 模块
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
-try:
-    from analyze_wallet import WalletAnalyzerV2, WalletScorerV2, TransactionDBManager
-except ImportError:
-    print("❌ 错误：找不到 analyze_wallet 模块")
-    sys.exit(1)
+from key_list import HELIUS_KEY_LIST, JUPITER_KEY_LIST
+from analyze_wallet import WalletAnalyzerV2, WalletScorerV2, TransactionDBManager
 
 # 配置日志
 logging.basicConfig(
@@ -49,7 +44,7 @@ WALLETS_FILE = str(TOOLS_DIR / "wallets_check.txt")
 RESULTS_DIR = str(Path(__file__).parent / "results")
 CONCURRENT_LIMIT = 5  # 并发限制
 DUST_THRESHOLD = 0.01  # 粉尘阈值：未实现收益低于此值的代币视为粉尘
-MAX_TXS = 500      # 最大交易数获取
+MAX_TXS = 500  # 最大交易数获取
 
 
 class APIKeyManager:
@@ -252,6 +247,53 @@ class TrashListManager:
         if self._trash_set is None:
             self.load()
         return address in (self._trash_set or set())
+    
+    def clear(self) -> bool:
+        """
+        清空黑名单
+        
+        Returns:
+            是否成功清空
+        """
+        try:
+            if os.path.exists(self.trash_file):
+                os.remove(self.trash_file)
+            self._trash_set = set()
+            logger.info("黑名单已清空")
+            return True
+        except Exception as e:
+            logger.error(f"清空黑名单失败: {e}")
+            return False
+    
+    def remove(self, address: str) -> bool:
+        """
+        从黑名单中移除地址
+        
+        Args:
+            address: 钱包地址
+            
+        Returns:
+            是否成功移除
+        """
+        try:
+            if self._trash_set is None:
+                self.load()
+            
+            if address not in self._trash_set:
+                return False
+            
+            # 重新写入文件（排除要移除的地址）
+            addresses = [addr for addr in self._trash_set if addr != address]
+            with open(self.trash_file, 'w', encoding='utf-8') as f:
+                for addr in addresses:
+                    f.write(f"{addr}\n")
+            
+            self._trash_set.remove(address)
+            logger.debug(f"已从黑名单移除地址: {address[:6]}...")
+            return True
+        except Exception as e:
+            logger.error(f"移除黑名单地址失败: {e}")
+            return False
 
 
 class WalletListLoader:
@@ -412,11 +454,16 @@ class BatchAnalyzerV2:
                 # 3. 计算评分（纯计算，无API调用）
                 scores = WalletScorerV2.calculate_scores(analysis_result)
 
-                # 4. 自动黑名单过滤（垃圾地址）
-                if scores["flags"].get("is_trash", False):
-                    self.trash_manager.add(address)
-                    pbar.update(1)
-                    return None
+                # 4. 提取垃圾地址信息（不过滤，写入报告）
+                # 注意：垃圾地址和黑名单地址的区别：
+                # - 黑名单地址：永久性问题（如地址不存在、无效地址），应该永久过滤
+                # - 垃圾地址：暂时表现不好（如快枪手、暂时亏损），但可能以后会变好
+                # 当前策略：垃圾地址不加入黑名单，但写入报告供参考
+                is_trash = scores["flags"].get("is_trash", False)
+                trash_reasons = scores["flags"].get("reasons", [])
+                trash_reasons_str = ", ".join(trash_reasons) if trash_reasons else ""
+                if is_trash:
+                    logger.debug(f"地址 {address[:8]}... 被识别为垃圾地址（写入报告）: {trash_reasons_str}")
 
                 # 5. 提取详细指标（纯数据处理）
                 results = analysis_result["results"]
@@ -459,6 +506,14 @@ class BatchAnalyzerV2:
 
                 # 9. 计算单币亏损超过95%的数量
                 severe_loss_count = len([r for r in losses if r.get('roi', 0) <= -0.95])
+                
+                # 10. 计算亏损代币数量
+                loss_count = len(losses)
+                
+                # 11. 计算去掉最高收益代币后的整体ROI
+                # profit_dim 中已经有 profit_pct_excluding_max（百分比），需要转换为ROI格式
+                profit_pct_excluding_max = profit_dim.get("profit_pct_excluding_max", 0)
+                roi_excluding_max = profit_pct_excluding_max / 100  # 转换为小数形式（如 0.5 表示 50%）
 
                 pbar.update(1)
                 return {
@@ -467,6 +522,8 @@ class BatchAnalyzerV2:
                     "战力评级": scores["tier"],
                     "最佳定位": best_role,
                     "定位评分": best_role_score,
+                    "垃圾地址": is_trash,
+                    "垃圾地址原因": trash_reasons_str,
                     "盈利力评分": profit_dim.get("score", 0),
                     "持久力评分": persistence_dim.get("score", 0),
                     "真实性评分": authenticity_dim.get("score", 0),
@@ -488,11 +545,13 @@ class BatchAnalyzerV2:
                     "7天代币数": persistence_dim.get("tokens_7d", 0),
                     "7天交易数": persistence_dim.get("tx_count_7d", 0),
                     "项目总数": len(results),
+                    "亏损代币数量": loss_count,
                     "未结算token数": unsettled_count,
                     "未结算盈利(SOL)": round(unsettled_profit, 2),
                     "未结算ROI": f"{unsettled_roi:.1%}",
                     "未结算平均持仓(分钟)": round(unsettled_avg_hold_time, 1),
                     "单币亏损>95%数量": severe_loss_count,
+                    "去掉最高收益后整体ROI": f"{roi_excluding_max:.1%}",
                     "分析时间": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "🛡️ 稳健中军": positioning.get("🛡️ 稳健中军", 0),
                     "⚔️ 土狗猎手": positioning.get("⚔️ 土狗猎手", 0),
@@ -706,13 +765,14 @@ class ReportExporterV2:
             # 重新排列列的顺序，让重要信息在前面
             important_cols = [
                 "钱包地址", "综合评分", "战力评级", "最佳定位", "定位评分",
+                "垃圾地址", "垃圾地址原因",
                 "盈利力评分", "持久力评分", "真实性评分",
                 "盈亏比", "胜率", "总盈亏(SOL)", "30天盈利(SOL)", "30天盈利(%)",
                 "7天盈利(SOL)", "7天盈利(%)", "最大单笔ROI", "最大单笔亏损",
                 "平均持仓(分钟)", "盈利持仓(分钟)", "亏损持仓(分钟)",
                 "代币多样性", "30天代币数", "30天交易数", "7天代币数", "7天交易数",
-                "项目总数", "未结算token数", "未结算盈利(SOL)", "未结算ROI", "未结算平均持仓(分钟)",
-                "单币亏损>95%数量",
+                "项目总数", "亏损代币数量", "未结算token数", "未结算盈利(SOL)", "未结算ROI", "未结算平均持仓(分钟)",
+                "单币亏损>95%数量", "去掉最高收益后整体ROI",
                 "🛡️ 稳健中军", "⚔️ 土狗猎手", "💎 钻石之手", "🚀 短线高手",
                 "分析时间"
             ]
@@ -770,7 +830,7 @@ async def main():
 
     # 初始化数据库管理器
     db_manager = TransactionDBManager()
-    
+
     # 初始化组件
     analyzer = WalletAnalyzerV2(db_manager=db_manager)  # 传入数据库管理器以支持缓存
     trash_manager = TrashListManager()
