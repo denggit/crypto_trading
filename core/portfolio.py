@@ -415,32 +415,58 @@ class PortfolioManager:
                         logger.error(f"⚠️ 关闭账户失败: {e}")
                 asyncio.create_task(safe_close_account())
                 
-                # 2. 发送【清仓汇总】邮件
+                # 2. 发送【清仓成绩单】邮件 (增强版)
                 try:
-                    # 生成完整的交易历史表格
-                    trade_table = self._generate_trade_history_table(token_mint)
-                    
-                    # 计算这笔投资的总盈亏 (Total PnL)
-                    # 从 trade_history 中筛选出该代币的所有买入和卖出
+                    # --- A. 算总账 (计算该币种全生命周期的盈亏) ---
                     token_trades = [r for r in self.trade_history if r.get('token') == token_mint]
+                    
+                    # 累计总投入 (BUY)
                     total_buy_sol = sum(r['value_sol'] for r in token_trades if r['action'] == 'BUY')
+                    
+                    # 累计总回收 (SELL) - 包含刚才那一笔
                     total_sell_sol = sum(r['value_sol'] for r in token_trades if 'SELL' in r['action'])
+                    
+                    # 净利润 & 收益率
                     net_profit = total_sell_sol - total_buy_sol
                     roi = (net_profit / total_buy_sol * 100) if total_buy_sol > 0 else 0
                     
-                    status_emoji = "🚀" if net_profit > 0 else "💸"
-                    
-                    subject = f"{status_emoji} 清仓通知: {token_mint[:6]}... (盈亏 {net_profit:+.4f} SOL)"
-                    msg = (
-                        f"检测到持仓已全部卖出，本次跟单结束。\n\n"
-                        f"代币: {token_mint}\n"
-                        f"总投入: {total_buy_sol:.4f} SOL\n"
-                        f"总回收: {total_sell_sol:.4f} SOL\n"
-                        f"净利润: {net_profit:+.4f} SOL\n"
-                        f"收益率: {roi:+.1f}%\n\n"
-                        f"【完整交易复盘】\n{trade_table}"
-                    )
-                    
+                    # --- B. 决定邮件标题和语气 ---
+                    if net_profit > 0:
+                        status_icon = "🚀"
+                        status_text = "止盈离场 (Win)"
+                        color_hex = "#4CAF50" # 绿色
+                    else:
+                        status_icon = "💸"
+                        status_text = "止损割肉 (Loss)"
+                        color_hex = "#FF5252" # 红色
+
+                    subject = f"{status_icon} 【清仓报告】{token_mint[:4]}... 结盈: {net_profit:+.4f} SOL ({roi:+.1f}%)"
+
+                    # --- C. 生成交易流水表 ---
+                    trade_table = self._generate_trade_history_table(token_mint)
+
+                    # --- D. 组装邮件正文 ---
+                    msg = f"""
+========================================
+       🤖 SmartFlow 交易结案报告
+========================================
+
+代币地址: {token_mint}
+交易结果: {status_text}
+
+📊 【最终财务统计】
+----------------------------------------
+💰 总投入本金:  {total_buy_sol:.4f} SOL
+💵 总回收资金:  {total_sell_sol:.4f} SOL
+----------------------------------------
+🔥 净利润 (PnL): {net_profit:+.4f} SOL
+📈 投资回报率:  {roi:+.2f}%
+
+📝 【完整操作复盘】
+{trade_table}
+
+(本邮件由 SmartFlow 自动生成，账户已自动关闭)
+"""
                     # 异步发送
                     async def safe_send_email():
                         try:
@@ -451,11 +477,11 @@ class PortfolioManager:
                     
                 except Exception as e:
                     logger.error(f"构建清仓邮件失败: {e}")
-            
-            else:
-                # 如果没清仓，只打印日志，不发邮件
-                logger.info(f"📉 [分批卖出] 本次卖出 {est_sol_out_sol:.4f} SOL，剩余持仓 {remaining_balance} (未清仓，不发邮件)")
 
+            else:
+                # 未清仓，仅日志
+                logger.info(f"📉 [分批卖出] 剩余持仓 {remaining_balance} (未清仓，不发邮件)")
+                
             self._save_portfolio()
             # 🔥 修复：将 lamports 转换为 SOL 单位
             est_sol_out_sol = est_sol_out / 10 ** 9
@@ -649,16 +675,64 @@ class PortfolioManager:
                                     est_sol_out_sol = est_sol_out / 10 ** 9
                                     self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out_sol)
 
-                                    # 发邮件（包含交易历史表格）
-                                    trade_table = self._generate_trade_history_table(token_mint)
-                                    msg = f"🚀 触发暴富止盈！\n\n代币: {token_mint}\n当前ROI: {roi * 100:.1f}%\n动作: {'全仓卖出' if is_clear_all else '卖出80%，保留火种'}\n到手SOL: {est_sol_out_sol:.4f}\n剩余仓位: {remaining_balance}\n\n【交易历史记录】\n{trade_table}"
-                                    # 🔥 修复：添加异常处理
-                                    async def safe_send_email():
-                                        try:
-                                            await send_email_async(f"💰 止盈通知: {token_mint}", msg)
-                                        except Exception as e:
-                                            logger.error(f"⚠️ 邮件发送失败: {e}")
-                                    asyncio.create_task(safe_send_email())
+                                    # 🔥🔥🔥【止盈邮件美化核心代码】🔥🔥🔥
+                                    try:
+                                        # 1. 计算本次止盈的财务数据
+                                        # 估算本次卖出部分的成本 (按比例分摊总成本)
+                                        total_cost = data['cost_sol'] # 总成本
+                                        # my_holdings_before 是卖出前的持仓量
+                                        cost_of_this_sell = 0.0
+                                        if my_holdings_before > 0:
+                                            cost_of_this_sell = total_cost * (amount_to_sell / my_holdings_before)
+                                        
+                                        # 本次落袋利润
+                                        realized_profit = est_sol_out_sol - cost_of_this_sell
+                                        
+                                        # 2. 计算剩余仓位的价值
+                                        # curr_val_lamports 是当前总价值，est_val_remaining 是剩余部分的价值
+                                        val_remaining_sol = est_val_remaining 
+                                        
+                                        # 3. 计算百分比
+                                        sell_pct = TAKE_PROFIT_SELL_PCT * 100
+                                        remain_pct = (1 - TAKE_PROFIT_SELL_PCT) * 100
+                                        
+                                        # 4. 生成历史表格
+                                        trade_table = self._generate_trade_history_table(token_mint)
+
+                                        subject = f"🚀 【暴富止盈】{token_mint[:4]}... 锁定利润 {realized_profit:+.4f} SOL"
+
+                                        msg = f"""
+========================================
+       🎉 SmartFlow 止盈锁定报告
+========================================
+
+代币地址: {token_mint}
+当前涨幅: {roi * 100:.1f}% (触发 1000% 止盈)
+
+💰 【本次锁定 (Pocket)】
+----------------------------------------
+🔨 卖出比例:  {sell_pct:.0f}%
+💵 到手资金:  {est_sol_out_sol:.4f} SOL
+🔥 本次净赚:  {realized_profit:+.4f} SOL (已落袋)
+
+💎 【剩余博弈 (Moonbag)】
+----------------------------------------
+📦 保留仓位:  {remain_pct:.0f}%
+🦄 当前价值:  {val_remaining_sol:.4f} SOL
+(成本已大幅收回，剩余仓位零风险格局！)
+
+📝 【交易流水】
+{trade_table}
+"""
+                                        async def safe_send_email():
+                                            try:
+                                                await send_email_async(subject, msg)
+                                            except Exception as e:
+                                                logger.error(f"⚠️ 邮件发送失败: {e}")
+                                        asyncio.create_task(safe_send_email())
+
+                                    except Exception as e:
+                                        logger.error(f"构建止盈邮件失败: {e}")
 
                                     # 稍微休息一下，防止针对同一个币疯狂触发
                                     await asyncio.sleep(60)
@@ -697,22 +771,57 @@ class PortfolioManager:
             est_sol_out_sol = est_sol_out / 10 ** 9
             self._record_history("SELL_FORCE", token_mint, amount, est_sol_out_sol)
             
-            # 生成交易历史表格
-            trade_table = self._generate_trade_history_table(token_mint)
-            
-            if roi == -0.99:
-                subject = f"🛡️ 防断网风控: {token_mint}"
-                msg = f"检测到聪明钱已清仓，已补救卖出。\n\n代币: {token_mint}\n卖出数量: {amount}\n到手SOL: {est_sol_out_sol:.4f}\n\n【交易历史记录】\n{trade_table}"
-            else:
-                subject = f"🚀 暴富止盈: {token_mint}"
-                msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出\n到手SOL: {est_sol_out_sol:.4f}\n\n【交易历史记录】\n{trade_table}"
-            # 🔥 修复：添加异常处理
-            async def safe_send_email():
-                try:
-                    await send_email_async(subject, msg)
-                except Exception as e:
-                    logger.error(f"⚠️ 邮件发送失败: {e}")
-            asyncio.create_task(safe_send_email())
+            # 🔥🔥🔥【邮件美化核心代码】🔥🔥🔥
+            try:
+                # A. 算总账
+                token_trades = [r for r in self.trade_history if r.get('token') == token_mint]
+                total_buy_sol = sum(r['value_sol'] for r in token_trades if r['action'] == 'BUY')
+                total_sell_sol = sum(r['value_sol'] for r in token_trades if 'SELL' in r['action']) # 包含刚才这一笔
+                net_profit = total_sell_sol - total_buy_sol
+                final_roi = (net_profit / total_buy_sol * 100) if total_buy_sol > 0 else 0
+
+                # B. 设定文案
+                if roi == -0.99:
+                    reason_title = "🛡️ 触发防断网/大哥清仓风控"
+                else:
+                    reason_title = "⚠️ 触发强制止损/其他风控"
+
+                status_icon = "🚀" if net_profit > 0 else "😭"
+                status_text = "盈利离场" if net_profit > 0 else "亏损离场"
+
+                subject = f"{status_icon} 【强平报告】{token_mint[:4]}... 结盈: {net_profit:+.4f} SOL"
+
+                trade_table = self._generate_trade_history_table(token_mint)
+
+                msg = f"""
+========================================
+       🤖 SmartFlow 风控执行报告
+========================================
+
+触发原因: {reason_title}
+执行动作: 全仓强制卖出
+交易结果: {status_text}
+
+📊 【最终财务统计】
+----------------------------------------
+💰 总投入本金:  {total_buy_sol:.4f} SOL
+💵 总回收资金:  {total_sell_sol:.4f} SOL
+----------------------------------------
+🔥 净利润 (PnL): {net_profit:+.4f} SOL
+📉 最终回报率:  {final_roi:+.2f}%
+
+📝 【完整操作复盘】
+{trade_table}
+"""
+                async def safe_send_email():
+                    try:
+                        await send_email_async(subject, msg)
+                    except Exception as e:
+                        logger.error(f"⚠️ 邮件发送失败: {e}")
+                asyncio.create_task(safe_send_email())
+                
+            except Exception as e:
+                logger.error(f"构建强平邮件失败: {e}")
 
     async def schedule_daily_report(self):
         """ 每日日报调度器 (支持自定义时间) """
