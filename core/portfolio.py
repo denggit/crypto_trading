@@ -317,6 +317,11 @@ class PortfolioManager:
         # 1. 检查持仓
         if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
             return
+        
+        # 🔥 修复：检查卖出数量是否有效
+        if smart_money_sold_amt is None or smart_money_sold_amt <= 0:
+            logger.warning(f"⚠️ [卖出跳过] {token_mint[:6]}... 卖出数量无效: {smart_money_sold_amt}")
+            return
 
         logger.info(f"👀 监测到大佬卖出 {token_mint[:6]}... 正在计算策略...")
 
@@ -326,17 +331,23 @@ class PortfolioManager:
 
         # 2. 先把卖出比例算出来
         smart_money_remaining = await self.trader.get_token_balance(TARGET_WALLET, token_mint)
+        # 🔥 修复：处理 smart_money_remaining 为 None 或异常的情况
+        if smart_money_remaining is None:
+            smart_money_remaining = 0.0
+        
         total_before_sell = smart_money_sold_amt + smart_money_remaining
 
         sell_ratio = 1.0
+        original_sell_ratio = 0.0  # 🔥 修复：保存原始卖出比例用于日志
         if total_before_sell > 0:
             sell_ratio = smart_money_sold_amt / total_before_sell
+            original_sell_ratio = sell_ratio  # 保存原始比例
 
             # 🔥 策略 A：90% 阈值清仓 (直接修改 is_force_clear)
             if sell_ratio > 0.90:
                 is_force_clear = True
                 sell_ratio = 1.0
-                reason_msg = f"(卖出比例 {sell_ratio:.1%} > 90% -> 触发清仓)"
+                reason_msg = f"(卖出比例 {original_sell_ratio:.1%} > 90% -> 触发清仓)"
 
         # 3. 策略 B：回合制 + 试盘过滤
         total_buys = self.get_buy_counts(token_mint)
@@ -644,10 +655,16 @@ class PortfolioManager:
                             try:
                                 # 复用刚才写的同步方法
                                 await self.sync_real_balance(token_mint)
+                                # 🔥 修复：同步后再次检查 token_mint 是否还存在（可能被清仓线程删除）
+                                if token_mint not in self.portfolio:
+                                    continue
                                 # 刷新一下 data 里的余额 (因为 sync_real_balance 可能改了它)
                                 data = self.portfolio[token_mint]
                             except Exception as e:
                                 logger.warning(f"⚠️ 同步余额失败 {token_mint}: {e}")
+                                # 🔥 修复：同步失败后也要检查 token_mint 是否还存在
+                                if token_mint not in self.portfolio:
+                                    continue
     
                             # 询价
                             quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
@@ -842,6 +859,10 @@ class PortfolioManager:
                     # 🔥🔥🔥 新增锁保护 🔥🔥🔥
                     async with self.get_token_lock(token_mint):
                         try:
+                            # 🔥 修复：再次检查 key 是否存在（可能被其他线程删除）
+                            if token_mint not in self.portfolio:
+                                continue
+                            
                             data = self.portfolio[token_mint]
                             if data['my_balance'] <= 0: 
                                 continue

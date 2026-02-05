@@ -129,6 +129,7 @@ class TransactionDBManager:
         Returns:
             交易记录列表（按时间倒序）
         """
+        conn = None
         try:
             conn = duckdb.connect(str(self.db_file))
             query = """
@@ -141,7 +142,6 @@ class TransactionDBManager:
                 query += f" LIMIT {limit}"
             
             result = conn.execute(query, [address]).fetchall()
-            conn.close()
             
             # 解析JSON数据
             transactions = []
@@ -158,6 +158,12 @@ class TransactionDBManager:
         except Exception as e:
             logger.error(f"查询交易记录失败: {e}")
             return []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"关闭数据库连接失败: {e}")
     
     def save_transactions(self, address: str, transactions: List[dict]):
         """
@@ -170,6 +176,7 @@ class TransactionDBManager:
         if not transactions:
             return
         
+        conn = None
         try:
             conn = duckdb.connect(str(self.db_file))
             
@@ -206,12 +213,17 @@ class TransactionDBManager:
                     continue
             
             conn.commit()
-            conn.close()
             
             if new_count > 0:
                 logger.debug(f"已保存 {new_count} 条新交易记录到数据库: {address[:8]}...")
         except Exception as e:
             logger.error(f"保存交易记录到数据库失败: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"关闭数据库连接失败: {e}")
     
     def get_transaction_count(self, address: str) -> int:
         """
@@ -223,17 +235,23 @@ class TransactionDBManager:
         Returns:
             交易记录数量
         """
+        conn = None
         try:
             conn = duckdb.connect(str(self.db_file))
             result = conn.execute(
                 "SELECT COUNT(*) FROM transactions WHERE address = ?",
                 [address]
             ).fetchone()
-            conn.close()
             return result[0] if result else 0
         except Exception as e:
             logger.error(f"查询交易记录数量失败: {e}")
             return 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"关闭数据库连接失败: {e}")
 
 
 class TransactionParser:
