@@ -139,6 +139,15 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                     buy_times_before = pm.get_buy_counts(token)
                     pm.add_position(token, est_out, COPY_AMOUNT_SOL)
                     logger.info(f"✅ 跟单成功: {token} | 预计获得: {est_out} | 仓位已记录")
+
+                    # 🔥🔥🔥 [新增] 延迟 2 秒后强制同步真实余额 🔥🔥🔥
+                    # 目的：防止Jupiter返回的 est_out 是虚的（比如有税或者滑点）
+                    await asyncio.sleep(2)
+                    try:
+                        await pm.sync_real_balance(token)
+                        logger.info(f"⚖️ [初始化] {token} 真实持仓已同步")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 初始化同步失败: {e}")
                     
                     # 📧 只有第一次买入时才发送邮件通知
                     if buy_times_before == 0:
