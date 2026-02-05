@@ -132,6 +132,34 @@ class PortfolioManager:
         self.trade_history.append(record)
         self._save_history()
 
+    # 📋 建议放在 add_position 方法之前
+    async def sync_real_balance(self, token_mint):
+        """
+        🔥 [核心修复] 强制从链上同步真实余额
+        解决：变基、通缩、高滑点导致的"虚空记账"问题
+        """
+        # 1. 获取你的钱包地址 (不是 Smart Money 的!)
+        my_wallet_address = str(self.trader.payer.pubkey())
+        
+        # 2. 查链上真实余额
+        real_balance = await self.trader.get_token_balance_raw(my_wallet_address, token_mint)
+        
+        if real_balance is not None:
+            # 加锁防止冲突
+            async with self.get_token_lock(token_mint):
+                if token_mint in self.portfolio:
+                    old_balance = self.portfolio[token_mint]['my_balance']
+                    
+                    # 只有偏差超过 1% 时才修正 (避免RPC微小抖动)
+                    if abs(real_balance - old_balance) > (old_balance * 0.01):
+                        logger.warning(
+                            f"⚖️ [余额修正] {token_mint[:6]}... "
+                            f"账本: {old_balance} -> 链上: {real_balance} | "
+                            f"修正原因: 滑点/税/通缩"
+                        )
+                        self.portfolio[token_mint]['my_balance'] = real_balance
+                        self._save_portfolio()
+    
     def add_position(self, token_mint, amount_bought, cost_sol):
         """
         添加持仓记录
@@ -592,8 +620,21 @@ class PortfolioManager:
                     # 🔥🔥🔥 新增锁保护 🔥🔥🔥
                     async with self.get_token_lock(token_mint):
                         try:
+                            # 再次检查 key 是否存在 (因为可能刚被清仓线程删了)
+                            if token_mint not in self.portfolio: continue
+                                
                             data = self.portfolio[token_mint]
                             if data['my_balance'] <= 0: continue
+
+                            # 🔥 2. [核心] 先同步真实余额！(净值法的第一步)
+                            # 如果这里不查，遇到通缩币就会算错
+                            try:
+                                # 复用刚才写的同步方法
+                                await self.sync_real_balance(token_mint)
+                                # 刷新一下 data 里的余额 (因为 sync_real_balance 可能改了它)
+                                data = self.portfolio[token_mint]
+                            except Exception as e:
+                                logger.warning(f"⚠️ 同步余额失败 {token_mint}: {e}")
     
                             # 询价
                             quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
