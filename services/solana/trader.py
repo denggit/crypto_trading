@@ -27,6 +27,7 @@ from spl.token.constants import TOKEN_PROGRAM_ID
 # 引入新配置
 from config.settings import (
     PRIVATE_KEY,
+    JUPITER_API_KEY,
     USE_JITO,
     JITO_TIP_AMOUNT,
     JITO_BLOCK_ENGINE_URL,
@@ -55,37 +56,79 @@ class SolanaTrader:
             raise e
 
         self.SOL_MINT = "So11111111111111111111111111111111111111112"
+        
+        # 打印配置信息
+        logger.info(f"💳 交易钱包已加载: {self.payer.pubkey()}")
+        logger.info(f"🔧 Jito 模式: {'✅ 已启用' if USE_JITO else '❌ 已禁用 (使用普通 RPC)'}")
+        if USE_JITO:
+            logger.info(f"💰 Jito 小费: {JITO_TIP_AMOUNT} SOL | 端点: {JITO_BLOCK_ENGINE_URL}")
+        if JUPITER_API_KEY:
+            logger.info(f"🔑 Jupiter API Key: 已配置")
+        else:
+            logger.warning(f"⚠️ Jupiter API Key: 未配置（可能遇到限流）")
+    
+    async def close(self):
+        """
+        关闭资源
+        
+        注意：在程序退出时调用此方法以正确释放资源
+        """
+        await self.rpc_client.close()
+        logger.info("🔒 交易客户端已关闭")
 
     async def get_token_balance(self, wallet_address: str, token_mint: str) -> float:
-        """获取指定代币余额 (保留原逻辑)"""
+        """
+        获取指定代币余额
+        
+        Args:
+            wallet_address: 钱包地址
+            token_mint: 代币地址
+            
+        Returns:
+            代币余额（浮点数），失败返回 0.0
+        """
         try:
             if token_mint == self.SOL_MINT:
                 resp = await self.rpc_client.get_balance(Pubkey.from_string(wallet_address))
                 return resp.value / 10 ** 9
 
+            # 🔥 修复：使用 TokenAccountOpts 对象而不是字典
+            opts = TokenAccountOpts(mint=Pubkey.from_string(token_mint))
             resp = await self.rpc_client.get_token_accounts_by_owner(
                 Pubkey.from_string(wallet_address),
-                {"mint": Pubkey.from_string(token_mint)}
+                opts
             )
             if not resp.value:
                 return 0.0
 
             account_data = resp.value[0].pubkey
             balance_resp = await self.rpc_client.get_token_account_balance(account_data)
-            return float(balance_resp.value.ui_amount)
+            return float(balance_resp.value.ui_amount) if balance_resp.value.ui_amount else 0.0
         except Exception as e:
             logger.error(f"获取余额失败: {e}")
             return 0.0
 
     async def get_token_balance_raw(self, wallet_address: str, token_mint: str) -> int:
-        """获取代币原始余额 (保留净值法修复逻辑)"""
+        """
+        获取代币原始余额（返回原始整数，用于精确询价）
+        
+        Args:
+            wallet_address: 钱包地址
+            token_mint: 代币地址
+            
+        Returns:
+            代币原始余额（整数 lamports），失败返回 None
+        """
         try:
             if token_mint == self.SOL_MINT:
-                return None
+                resp = await self.rpc_client.get_balance(Pubkey.from_string(wallet_address))
+                return int(resp.value)
 
+            # 🔥 修复：使用 TokenAccountOpts 对象而不是字典
+            opts = TokenAccountOpts(mint=Pubkey.from_string(token_mint))
             resp = await self.rpc_client.get_token_accounts_by_owner(
                 Pubkey.from_string(wallet_address),
-                {"mint": Pubkey.from_string(token_mint)}
+                opts
             )
             if not resp.value:
                 return 0
@@ -98,20 +141,73 @@ class SolanaTrader:
             return None
 
     async def get_quote(self, session, input_mint, output_mint, amount_lamports, slippage_bps=50):
-        """从 Jupiter 获取报价 (保留原逻辑)"""
+        """
+        从 Jupiter 获取报价
+        
+        Args:
+            session: aiohttp 会话
+            input_mint: 输入代币地址
+            output_mint: 输出代币地址
+            amount_lamports: 输入数量（lamports，整数）
+            slippage_bps: 滑点（basis points）
+            
+        Returns:
+            quote 响应数据，失败返回 None
+        """
         url = "https://quote-api.jup.ag/v6/quote"
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
-            "amount": amount_lamports,
+            "amount": str(int(amount_lamports)),  # 🔥 修复：Jupiter API 需要字符串格式
             "slippageBps": slippage_bps
         }
+        # 🔥 修复：添加 Jupiter API Key 支持
+        headers = {"Accept": "application/json"}
+        if JUPITER_API_KEY:
+            headers["x-api-key"] = JUPITER_API_KEY
+        
         try:
-            async with session.get(url, params=params) as response:
+            # 🔥 添加超时设置，防止长时间等待
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            async with session.get(url, params=params, headers=headers, timeout=timeout) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"❌ 询价API失败 [{response.status}]: {error_text[:500]}")
+                    return None
                 return await response.json()
-        except Exception as e:
-            logger.error(f"询价失败: {e}")
+        except asyncio.TimeoutError:
+            logger.error(f"❌ 询价超时: Jupiter API 响应超时（30秒）")
             return None
+        except Exception as e:
+            logger.error(f"❌ 询价网络异常: {e}")
+            return None
+
+    async def _send_via_rpc(self, swap_transaction_buf, est_out):
+        """
+        通过普通 RPC 发送交易（降级方法）
+        
+        Args:
+            swap_transaction_buf: Swap 交易字节数据
+            est_out: 预计输出数量
+            
+        Returns:
+            (success: bool, out_amount: int): 交易是否成功，预计输出数量
+        """
+        try:
+            logger.info("📡 [降级模式] 使用普通 RPC 发送交易...")
+            tx = VersionedTransaction.from_bytes(swap_transaction_buf)
+            signed_tx = VersionedTransaction(tx.message, [self.payer])
+
+            opts = TxOpts(skip_preflight=True, max_retries=3)
+            signature = await self.rpc_client.send_transaction(signed_tx, opts=opts)
+            logger.info(f"✅ [降级模式] 普通交易发送成功! Hash: {signature.value}")
+
+            await asyncio.sleep(2)
+            return True, est_out
+        except Exception as e:
+            logger.error(f"❌ [降级模式] 普通交易执行异常: {e}")
+            logger.error(traceback.format_exc())
+            return False, 0
 
     async def send_jito_bundle(self, jupiter_tx_bytes):
         """
@@ -144,7 +240,9 @@ class SolanaTrader:
             )
             tip_tx = VersionedTransaction(tip_msg, [self.payer])
 
-            # 3. 重新签署两笔交易
+            # 3. 重新签署 Swap 交易
+            # 🔥 注意：Jupiter 返回的交易可能已经部分签名，但我们仍需要用自己的私钥签名
+            # 使用 swap_tx.message 重新构建交易，确保使用最新的 blockhash
             signed_swap_tx = VersionedTransaction(swap_tx.message, [self.payer])
 
             # 4. 编码为 Base58 (Jito API 要求)
@@ -162,14 +260,22 @@ class SolanaTrader:
             logger.info(f"🚀 发送 Jito Bundle... (节点: {JITO_BLOCK_ENGINE_URL}, 小费: {JITO_TIP_AMOUNT} SOL)")
 
             async with aiohttp.ClientSession() as session:
-                async with session.post(JITO_BLOCK_ENGINE_URL, json=payload) as resp:
+                async with session.post(JITO_BLOCK_ENGINE_URL, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(f"❌ Jito API 请求失败 [{resp.status}]: {error_text[:500]}")
+                        return False
+                    
                     data = await resp.json()
                     if "result" in data:
                         bundle_id = data["result"]
                         logger.info(f"✅ Jito Bundle 已提交! ID: {bundle_id}")
                         return True
+                    elif "error" in data:
+                        logger.error(f"❌ Jito 发送失败: {data.get('error', {})}")
+                        return False
                     else:
-                        logger.error(f"❌ Jito 发送失败: {data}")
+                        logger.error(f"❌ Jito 响应格式异常: {data}")
                         return False
 
         except Exception as e:
@@ -201,22 +307,34 @@ class SolanaTrader:
                 "computeUnitPriceMicroLamports": priority_fee
             }
 
+            # 🔥 修复：使用正确的 Jupiter Swap API 端点
+            swap_url = "https://quote-api.jup.ag/v6/swap"
+            # 🔥 修复：添加 Jupiter API Key 支持
+            headers = {"Content-Type": "application/json"}
+            if JUPITER_API_KEY:
+                headers["x-api-key"] = JUPITER_API_KEY
+            
             try:
-                async with session.post("https://quote-api.jup.ag/v6/swap", json=swap_payload) as response:
+                async with session.post(swap_url, json=swap_payload, headers=headers) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"❌ Swap API失败 [{response.status}]: {error_text[:500]}")
+                        return False, 0
                     swap_resp = await response.json()
             except Exception as e:
-                logger.error(f"Jupiter API 请求失败: {e}")
+                logger.error(f"❌ Jupiter API 请求失败: {e}")
+                logger.error(traceback.format_exc())
                 return False, 0
 
             if "swapTransaction" not in swap_resp:
-                logger.error(f"获取 Swap 交易失败: {swap_resp}")
+                logger.error(f"❌ 获取 Swap 交易失败: {swap_resp}")
                 return False, 0
 
             swap_transaction_buf = base64.b64decode(swap_resp["swapTransaction"])
 
             # --- 分支逻辑：Jito vs 普通 RPC ---
             if USE_JITO:
-                # 🅰️ Jito 模式
+                # 🅰️ Jito 模式（带降级机制）
                 success = await self.send_jito_bundle(swap_transaction_buf)
                 if success:
                     # Jito 不返回即时结果，简单等待几秒认为上链
@@ -224,22 +342,12 @@ class SolanaTrader:
                     await asyncio.sleep(2)
                     return True, est_out
                 else:
-                    return False, 0
+                    # 🔥 降级机制：Jito 失败时自动降级到普通 RPC
+                    logger.warning("⚠️ Jito 发送失败，自动降级到普通 RPC 模式...")
+                    return await self._send_via_rpc(swap_transaction_buf, est_out)
             else:
-                # 🅱️ 普通 RPC 模式 (保留原文件逻辑)
-                try:
-                    tx = VersionedTransaction.from_bytes(swap_transaction_buf)
-                    signed_tx = VersionedTransaction(tx.message, [self.payer])
-
-                    opts = TxOpts(skip_preflight=True, max_retries=3)
-                    signature = await self.rpc_client.send_transaction(signed_tx, opts=opts)
-                    logger.info(f"📡 普通交易发送成功: {signature.value}")
-
-                    await asyncio.sleep(2)
-                    return True, est_out
-                except Exception as e:
-                    logger.error(f"普通交易执行异常: {e}")
-                    return False, 0
+                # 🅱️ 普通 RPC 模式（直接使用）
+                return await self._send_via_rpc(swap_transaction_buf, est_out)
 
     async def close_token_account(self, token_mint_str):
         """ 🔥 回收租金：关闭空的代币账户，拿回 0.002 SOL """
