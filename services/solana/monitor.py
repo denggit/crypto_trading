@@ -54,6 +54,9 @@ async def fetch_transaction_details(session, signature):
 
 
 def parse_tx(tx_data):
+    """
+    解析交易数据 (修复版：解决 WSOL 忽略问题 + 防止重复记账)
+    """
     if not tx_data: return None
 
     token_transfers = tx_data.get('tokenTransfers', [])
@@ -66,29 +69,61 @@ def parse_tx(tx_data):
         "sol_spent": 0.0
     }
 
+    # 定义常量
+    WSOL_MINT = "So11111111111111111111111111111111111111112"
+    # 你的 IGNORE_MINTS 列表需要在外部定义或这里引用
+    # IGNORE_MINTS = [...]
+
     out_tokens = []
     in_tokens = []
+    wsol_spent = 0.0  # 单独追踪 WSOL 花费
 
+    # --- 1. 处理 Token 转账 ---
     for tx in token_transfers:
         mint = tx['mint']
-        if mint in IGNORE_MINTS: continue
+        token_amount = tx.get('tokenAmount', 0)
 
+        # 🛡️ 特殊处理 WSOL：计入成本，但不作为买卖目标
+        if mint == WSOL_MINT:
+            if tx['fromUserAccount'] == TARGET_WALLET:
+                # Helius 的 tokenTransfers 通常已经是 Decimal 格式 (如 4.95)
+                # 不需要除以 1e9，直接累加
+                wsol_spent += float(token_amount)
+            continue
+
+        # 忽略黑名单代币 (USDC/USDT)
+        if mint in IGNORE_MINTS:
+            continue
+
+        # 统计目标代币
         if tx['fromUserAccount'] == TARGET_WALLET:
-            out_tokens.append((mint, tx['tokenAmount']))
+            out_tokens.append((mint, token_amount))
         elif tx['toUserAccount'] == TARGET_WALLET:
-            in_tokens.append((mint, tx['tokenAmount']))
+            in_tokens.append((mint, token_amount))
 
-    # 计算 SOL 变动
-    sol_change = 0
+    # --- 2. 处理 Native SOL 转账 ---
+    native_sol_spent = 0.0
+    sol_balance_change = 0
+
     for nt in native_transfers:
+        amount = nt.get('amount', 0)  # 这是 lamports
         if nt['fromUserAccount'] == TARGET_WALLET:
-            sol_change -= nt['amount']
+            sol_balance_change -= amount
         elif nt['toUserAccount'] == TARGET_WALLET:
-            sol_change += nt['amount']
+            sol_balance_change += amount
 
-    if sol_change < 0:
-        trade_info['sol_spent'] = abs(sol_change) / 10 ** 9
+    # 只有当 SOL 净减少时，才计入花费
+    # (如果是正数，说明可能是在卖出代币换回 SOL，或者是收到退款)
+    if sol_balance_change < 0:
+        native_sol_spent = abs(sol_balance_change) / 10 ** 9
 
+    # --- 3. 🔥 核心计算逻辑：取最大值防止双重计算 ---
+    # 场景 A (纯SOL买): Native花费 5, WSOL花费 0 -> Cost 5
+    # 场景 B (Wrap+Swap): Native花费 5(去Wrap), WSOL花费 5(去Swap) -> Cost 5 (取 Max)
+    # 场景 C (纯WSOL买): Native花费 0, WSOL花费 5 -> Cost 5
+    trade_info['sol_spent'] = max(native_sol_spent, wsol_spent)
+
+    # --- 4. 判定买卖方向 ---
     if in_tokens:
         trade_info['action'] = "BUY"
         trade_info['token_address'] = in_tokens[0][0]
