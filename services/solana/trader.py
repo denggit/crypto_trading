@@ -154,11 +154,12 @@ class SolanaTrader:
         Returns:
             quote 响应数据，失败返回 None
         """
-        url = "https://quote-api.jup.ag/v6/quote"
+        # 🔥 修复：使用正确的 Jupiter API v1 端点
+        url = "https://api.jup.ag/swap/v1/quote"
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
-            "amount": str(int(amount_lamports)),  # 🔥 修复：Jupiter API 需要字符串格式
+            "amount": str(int(amount_lamports)),  # Jupiter API 需要字符串格式
             "slippageBps": slippage_bps
         }
         # 🔥 修复：添加 Jupiter API Key 支持
@@ -307,8 +308,8 @@ class SolanaTrader:
                 "computeUnitPriceMicroLamports": priority_fee
             }
 
-            # 🔥 修复：使用正确的 Jupiter Swap API 端点
-            swap_url = "https://quote-api.jup.ag/v6/swap"
+            # 🔥 修复：使用正确的 Jupiter Swap API v1 端点
+            swap_url = "https://api.jup.ag/swap/v1/swap"
             # 🔥 修复：添加 Jupiter API Key 支持
             headers = {"Content-Type": "application/json"}
             if JUPITER_API_KEY:
