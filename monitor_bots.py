@@ -298,7 +298,7 @@ def create_bot_configs() -> List[BotConfig]:
             name="botA_tugou",
             project_dir=f"{base_path}/botA_tugou",
             main_script="main.py",
-            log_file="B.out"
+            log_file="A.out"
         ),
         BotConfig(
             name="botB_stable",
@@ -310,7 +310,7 @@ def create_bot_configs() -> List[BotConfig]:
             name="botC_diamond",
             project_dir=f"{base_path}/botC_diamond",
             main_script="main.py",
-            log_file="B.out"
+            log_file="C.out"
         ),
     ]
 

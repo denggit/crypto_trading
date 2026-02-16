@@ -31,7 +31,8 @@ BOT_NAME = os.getenv("BOT_NAME", "NONAME")
 
 # --- 策略配置 (支持动态调整) ---
 # 强制转换为 float/int，防止从 .env 读取到字符串导致计算错误
-COPY_AMOUNT_SOL = float(os.getenv("COPY_AMOUNT_SOL", 0.1))
+# 本币为 USDC：每次跟单买入金额（单位：USDC）
+COPY_AMOUNT_USDC = float(os.getenv("COPY_AMOUNT_USDC", 10.0))
 SLIPPAGE_BUY = int(os.getenv("SLIPPAGE_BUY", 1000))
 SLIPPAGE_SELL = int(os.getenv("SLIPPAGE_SELL", 2000))
 TAKE_PROFIT_ROI = float(os.getenv("TAKE_PROFIT_ROI", 10.0))
@@ -49,10 +50,10 @@ MIN_FDV = int(os.getenv("MIN_FDV", 0))
 MIN_SMART_MONEY_COST = float(os.getenv("MIN_SMART_MONEY_COST", 1.0))
 
 # 🛡️ V4 Pro 双重熔断风控机制
-# 1. 【核心风控】单币最大持仓成本 (SOL)
+# 1. 【核心风控】单币最大持仓成本 (USDC，本币)
 # 只要在这个币上总共花的钱没超过这个值，就会一直跟单
 # 只有在完全清仓后，成本才会归零，可以重新买入
-MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", 2.0))
+MAX_POSITION_USDC = float(os.getenv("MAX_POSITION_USDC", 200.0))
 
 # 2. 【频次风控】单币最大买入次数硬限制
 # 给一个宽松的上限（如 20 次），仅用于防止 API 被刷爆或恶意脚本
@@ -79,8 +80,10 @@ except ValueError:
     print(f"⚠️ [配置警告] DAILY_REPORT_TIME 格式错误 ({_daily_time_str})，重置为 09:00")
     REPORT_HOUR, REPORT_MINUTE = 9, 0
 
-# --- 币地址 ---
+# --- 币地址与精度 ---
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+# USDC 精度（用于原始数量与显示数量换算）
+USDC_DECIMALS = 6
 
 # --- Jito MEV 防护配置 ---
 # 是否开启 Jito 模式 (默认开启，.env 可覆盖)

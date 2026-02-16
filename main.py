@@ -11,8 +11,8 @@ import asyncio
 import os
 import traceback  # 🔥 引入错误堆栈打印
 
-from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, \
-    MIN_FDV, MAX_POSITION_SOL, MAX_BUY_COUNTS_HARD_LIMIT
+from config.settings import RPC_URL, COPY_AMOUNT_USDC, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, \
+    MIN_FDV, MAX_POSITION_USDC, MAX_BUY_COUNTS_HARD_LIMIT, USDC_DECIMALS
 from core.portfolio import PortfolioManager
 from services.notification import send_email_async
 from services.risk_control import check_token_liquidity, check_is_safe_token
@@ -82,13 +82,13 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
 
             # --- 3. 资金敞口限制 (双重熔断逻辑) ---
             
-            # 获取当前已投入成本
+            # 获取当前已投入成本（本币 USDC）
             current_cost = pm.get_position_cost(token)
             
             # 【熔断 1】金额风控：防止归零风险
-            # 逻辑：(已花掉的钱 + 这次要花的钱) 是否超过 MAX_POSITION_SOL？
-            if current_cost + COPY_AMOUNT_SOL > MAX_POSITION_SOL:
-                logger.warning(f"🛑 [金额熔断] {token[:16]}... 总投入将超限: {current_cost:.2f} + {COPY_AMOUNT_SOL:.2f} > {MAX_POSITION_SOL:.2f} SOL")
+            # 逻辑：(已花掉的钱 + 这次要花的钱) 是否超过 MAX_POSITION_USDC？
+            if current_cost + COPY_AMOUNT_USDC > MAX_POSITION_USDC:
+                logger.warning(f"🛑 [金额熔断] {token[:16]}... 总投入将超限: {current_cost:.2f} + {COPY_AMOUNT_USDC:.2f} > {MAX_POSITION_USDC:.2f} USDC")
                 return
 
             # 【熔断 2】频次风控：防止高频刷单/技术滥用
@@ -98,23 +98,26 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                 logger.warning(f"🛑 [频次熔断] {token} 买入次数异常 ({buy_times})，强制停止")
                 return
 
-            # --- 4. 钱包余额检查 ---
-            my_balance = await pm.trader.get_token_balance(str(pm.trader.payer.pubkey()), pm.trader.SOL_MINT)
-            safe_margin = COPY_AMOUNT_SOL * 2  # 预留2倍Gas费
+            # --- 4. 钱包余额检查（本币 USDC + SOL 预留 Gas）---
+            usdc_balance = await pm.trader.get_token_balance(str(pm.trader.payer.pubkey()), pm.trader.QUOTE_MINT)
+            sol_balance = await pm.trader.get_token_balance(str(pm.trader.payer.pubkey()), pm.trader.SOL_MINT)
+            min_sol_for_gas = 0.02  # 至少保留约 0.02 SOL 用于 Gas
 
-            if my_balance < safe_margin:
-                logger.warning(f"💸 [余额不足] 当前: {my_balance:.4f} SOL，暂停买入")
+            if usdc_balance < COPY_AMOUNT_USDC:
+                logger.warning(f"💸 [USDC 不足] 当前: {usdc_balance:.2f} USDC，需要 {COPY_AMOUNT_USDC:.2f} USDC，暂停买入")
+                return
+            if sol_balance < min_sol_for_gas:
+                logger.warning(f"💸 [SOL 不足] 当前: {sol_balance:.4f} SOL（预留 Gas 需约 {min_sol_for_gas} SOL），暂停买入")
                 return
 
             # --- 5. 执行买入 ---
-            # 🔥 修复日志：打印代币地址和成本信息！
-            logger.info(f"🔍 体检通过 [{token}]: 池子 ${liq:,.0f} | 余额 {my_balance:.2f} SOL | 当前成本 {current_cost:.2f} SOL | 第 {buy_times + 1} 次")
+            logger.info(f"🔍 体检通过 [{token}]: 池子 ${liq:,.0f} | USDC 余额 {usdc_balance:.2f} | 当前成本 {current_cost:.2f} USDC | 第 {buy_times + 1} 次")
 
             async with pm.get_token_lock(token):
                 # 双重检查（防止并发）
                 current_cost_check = pm.get_position_cost(token)
-                if current_cost_check + COPY_AMOUNT_SOL > MAX_POSITION_SOL:
-                    logger.warning(f"🛑 [双重检查失败] {token} 金额熔断: 当前成本 {current_cost_check:.2f} + 本次 {COPY_AMOUNT_SOL:.2f} > 上限 {MAX_POSITION_SOL:.2f} SOL")
+                if current_cost_check + COPY_AMOUNT_USDC > MAX_POSITION_USDC:
+                    logger.warning(f"🛑 [双重检查失败] {token} 金额熔断: 当前成本 {current_cost_check:.2f} + 本次 {COPY_AMOUNT_USDC:.2f} > 上限 {MAX_POSITION_USDC:.2f} USDC")
                     return
                 
                 buy_times_check = pm.get_buy_counts(token)
@@ -122,26 +125,22 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                     logger.warning(f"🛑 [双重检查失败] {token} 频次熔断: 买入次数 {buy_times_check} >= 上限 {MAX_BUY_COUNTS_HARD_LIMIT}")
                     return
 
-                amount_in = int(COPY_AMOUNT_SOL * 10 ** 9)
-                logger.info(f"💰 开始执行买入: {token} | 金额: {COPY_AMOUNT_SOL:.4f} SOL ({amount_in} lamports)")
+                amount_in = int(COPY_AMOUNT_USDC * (10 ** USDC_DECIMALS))
+                logger.info(f"💰 开始执行买入: {token} | 金额: {COPY_AMOUNT_USDC:.2f} USDC ({amount_in} 原始单位)")
 
-                # 🔥🔥 核心修复：填入真正的参数，而不是 ... 🔥🔥
+                # 使用 USDC 本币买入
                 success, est_out = await pm.trader.execute_swap(
-                    input_mint=pm.trader.SOL_MINT,  # 用 SOL 买
+                    input_mint=pm.trader.QUOTE_MINT,  # 用 USDC 买
                     output_mint=token,  # 买这个 Token
-                    amount_lamports=amount_in,  # 买多少
+                    amount_lamports=amount_in,  # USDC 原始数量（6 位小数）
                     slippage_bps=SLIPPAGE_BUY  # 滑点
                 )
 
                 if success:
-                    # 🔥 修复：cost_sol 应该是 SOL 数量，不是 lamports
-                    # 先记录买入次数，判断是否为第一次买入
                     buy_times_before = pm.get_buy_counts(token)
-                    await pm.add_position(token, est_out, COPY_AMOUNT_SOL)
+                    await pm.add_position(token, est_out, COPY_AMOUNT_USDC)
                     logger.info(f"✅ 跟单成功: {token} | 预计获得: {est_out} | 仓位已记录")
 
-                    # 🔥🔥🔥 [新增] 延迟 2 秒后强制同步真实余额 🔥🔥🔥
-                    # 目的：防止Jupiter返回的 est_out 是虚的（比如有税或者滑点）
                     await asyncio.sleep(2)
                     try:
                         await pm.sync_real_balance(token)
@@ -149,9 +148,8 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                     except Exception as e:
                         logger.warning(f"⚠️ 初始化同步失败: {e}")
                     
-                    # 📧 只有第一次买入时才发送邮件通知
                     if buy_times_before == 0:
-                        msg = f"✅ 首次买入交易成功\n\n代币: {token}\n买入数量: {est_out}\n成本: {COPY_AMOUNT_SOL:.4f} SOL"
+                        msg = f"✅ 首次买入交易成功\n\n代币: {token}\n买入数量: {est_out}\n成本: {COPY_AMOUNT_USDC:.2f} USDC"
                         async def safe_send_email():
                             try:
                                 await send_email_async(f"📈 买入通知: {token}", msg)

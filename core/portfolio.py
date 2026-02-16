@@ -14,9 +14,9 @@ from datetime import datetime, timedelta
 
 import aiohttp
 
-# 导入配置和工具
+# 导入配置和工具（本币 USDC）
 from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI, REPORT_HOUR, REPORT_MINUTE, \
-    TAKE_PROFIT_SELL_PCT, STOP_LOSS_PCT, USDC_MINT
+    TAKE_PROFIT_SELL_PCT, STOP_LOSS_PCT, USDC_MINT, USDC_DECIMALS
 from services.notification import send_email_async
 from utils.logger import logger
 
@@ -55,6 +55,10 @@ class PortfolioManager:
             try:
                 with open(PORTFOLIO_FILE, 'r', encoding='utf-8') as f:
                     self.portfolio = json.load(f)
+                # 兼容旧数据：将 cost_sol 迁移为 cost_usdc（本币已改为 USDC）
+                for mint, data in self.portfolio.items():
+                    if isinstance(data, dict) and 'cost_sol' in data and 'cost_usdc' not in data:
+                        data['cost_usdc'] = data['cost_sol']
                 logger.info(f"📂 已恢复持仓记忆: {len(self.portfolio)} 个代币")
             except Exception as e:
                 logger.error(f"❌ 读取持仓文件失败: {e}")
@@ -121,13 +125,13 @@ class PortfolioManager:
         except Exception as e:
             logger.error(f"❌ 后台写入文件失败 {filepath}: {e}")
 
-    def _record_history(self, action, token, amount, value_sol):
+    def _record_history(self, action, token, amount, value_usdc):
         record = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "action": action,
             "token": token,
             "amount": amount,
-            "value_sol": value_sol
+            "value_usdc": value_usdc
         }
         self.trade_history.append(record)
         self._save_history()
@@ -184,35 +188,31 @@ class PortfolioManager:
                             self._record_history("BUY", token_mint, diff, 0.0)
                             logger.info(f"📈 [历史修正] 已记录 {diff} 个代币的增量")
     
-    async def add_position(self, token_mint, amount_bought, cost_sol):
+    async def add_position(self, token_mint, amount_bought, cost_usdc):
         """
-        添加持仓记录
-        
+        添加持仓记录（本币 USDC）
+
         Args:
             token_mint: 代币地址
-            amount_bought: 买入数量
-            cost_sol: 成本（SOL）
+            amount_bought: 买入数量（原始单位）
+            cost_usdc: 成本（USDC）
         """
-        # 🔥 修复：添加输入验证
-        if amount_bought <= 0 or cost_sol < 0:
-            logger.error(f"❌ [输入验证失败] {token_mint[:6]}... 买入数量: {amount_bought}, 成本: {cost_sol}")
+        if amount_bought <= 0 or cost_usdc < 0:
+            logger.error(f"❌ [输入验证失败] {token_mint[:6]}... 买入数量: {amount_bought}, 成本: {cost_usdc}")
             return
-        
-        # 🔥 修复：添加锁保护，确保并发安全
+
         async with self.get_token_lock(token_mint):
             if token_mint not in self.portfolio:
-                self.portfolio[token_mint] = {'my_balance': 0, 'cost_sol': 0}
+                self.portfolio[token_mint] = {'my_balance': 0, 'cost_usdc': 0}
 
             self.portfolio[token_mint]['my_balance'] += amount_bought
-            self.portfolio[token_mint]['cost_sol'] += cost_sol
-            # 🔥 新增：记录买入时间戳，用于防止链上数据同步延迟导致的误判
+            self.portfolio[token_mint]['cost_usdc'] = self.portfolio[token_mint].get('cost_usdc', self.portfolio[token_mint].get('cost_sol', 0)) + cost_usdc
             self.portfolio[token_mint]['last_buy_time'] = time.time()
 
-            # 更新缓存
             self.buy_counts_cache[token_mint] = self.buy_counts_cache.get(token_mint, 0) + 1
 
             self._save_portfolio()
-            self._record_history("BUY", token_mint, amount_bought, cost_sol)
+            self._record_history("BUY", token_mint, amount_bought, cost_usdc)
             logger.info(
                 f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']} | 第 {self.buy_counts_cache[token_mint]} 次买入")
 
@@ -230,16 +230,13 @@ class PortfolioManager:
 
     def get_position_cost(self, token_mint):
         """
-        获取当前代币的总投入成本 (SOL)
-        注意：
-        1. 这里返回的是【成本】，不是【当前价值】。跌了成本不变，所以不会触发"越跌越补"的死循环。
-        2. 按比例卖出时，成本不会减少，只有完全清仓后，成本才会归零。
-        3. 这样设计是为了避免因为收益达到设定限制而无限减仓。
+        获取当前代币的总投入成本（本币 USDC）
+        注意：成本在按比例卖出时会按比例减少，完全清仓后归零。
         :param token_mint: 代币地址
-        :return: 当前持仓的总投入成本（SOL）
+        :return: 当前持仓的总投入成本（USDC）
         """
         if token_mint in self.portfolio:
-            return self.portfolio[token_mint].get('cost_sol', 0.0)
+            return self.portfolio[token_mint].get('cost_usdc', self.portfolio[token_mint].get('cost_sol', 0.0))
         return 0.0
 
     def _generate_trade_history_table(self, token_mint):
@@ -261,14 +258,14 @@ class PortfolioManager:
         total_cost = 0.0
         table_lines = []
         table_lines.append("=" * 100)
-        table_lines.append(f"{'时间':<20} {'交易方式':<12} {'数量':<20} {'成本(SOL)':<15} {'盈利情况':<20} {'剩余仓位':<15}")
+        table_lines.append(f"{'时间':<20} {'交易方式':<12} {'数量':<20} {'成本(USDC)':<15} {'盈利情况':<20} {'剩余仓位':<15}")
         table_lines.append("=" * 100)
         
         for record in token_trades:
             time_str = record.get('time', '')
             action = record.get('action', '')
             amount = record.get('amount', 0)
-            value_sol = record.get('value_sol', 0)
+            value_usdc = record.get('value_usdc', record.get('value_sol', 0))
             
             # 简化代币地址显示
             token_short = f"{token_mint[:6]}...{token_mint[-4:]}"
@@ -277,7 +274,7 @@ class PortfolioManager:
             if action == 'BUY':
                 trade_type = "买入"
                 current_holding += amount
-                total_cost += value_sol
+                total_cost += value_usdc
                 profit_info = "-"
                 remaining = current_holding
             elif 'SELL' in action:
@@ -285,9 +282,9 @@ class PortfolioManager:
                 if current_holding > 0:
                     avg_cost = total_cost / current_holding if current_holding > 0 else 0
                     cost_of_sell = avg_cost * amount
-                    profit = value_sol - cost_of_sell
+                    profit = value_usdc - cost_of_sell
                     profit_pct = (profit / cost_of_sell * 100) if cost_of_sell > 0 else 0
-                    profit_info = f"{profit:+.4f} SOL ({profit_pct:+.1f}%)"
+                    profit_info = f"{profit:+.2f} USDC ({profit_pct:+.1f}%)"
                     current_holding -= amount
                     total_cost = max(0, total_cost - cost_of_sell)
                 else:
@@ -316,7 +313,7 @@ class PortfolioManager:
                 remaining_str = f"{remaining:.0f}"
             
             table_lines.append(
-                f"{time_str:<20} {trade_type:<12} {amount_str:<20} {value_sol:<15.4f} {profit_info:<20} {remaining_str:<15}"
+                f"{time_str:<20} {trade_type:<12} {amount_str:<20} {value_usdc:<15.2f} {profit_info:<20} {remaining_str:<15}"
             )
         
         table_lines.append("=" * 100)
@@ -324,10 +321,10 @@ class PortfolioManager:
         # 添加总结信息
         if current_holding > 0:
             table_lines.append(f"\n当前剩余仓位: {current_holding}")
-            table_lines.append(f"累计成本: {total_cost:.4f} SOL")
+            table_lines.append(f"累计成本: {total_cost:.2f} USDC")
         else:
             table_lines.append(f"\n已全部清仓")
-            table_lines.append(f"累计成本: {total_cost:.4f} SOL")
+            table_lines.append(f"累计成本: {total_cost:.2f} USDC")
         
         return "\n".join(table_lines)
 
@@ -423,72 +420,55 @@ class PortfolioManager:
             if amount_to_sell < 100:
                 return
 
-        # 🔥🔥🔥 防粉尘卖出 (Gas Protection) 🔥🔥🔥
+        # 防粉尘卖出：预计价值过低则跳过（本币 USDC）
         async with aiohttp.ClientSession() as session:
             quote = await self.trader.get_quote(
-                session, token_mint, self.trader.SOL_MINT, amount_to_sell
+                session, token_mint, self.trader.QUOTE_MINT, amount_to_sell
             )
 
             if quote:
-                est_val_sol = int(quote['outAmount']) / 10 ** 9
-                # 设定门槛：0.01 SOL (约 $1.5 - $2)
-                if est_val_sol < 0.01:
+                est_val_usdc = int(quote['outAmount']) / (10 ** USDC_DECIMALS)
+                if est_val_usdc < 1.0:
                     logger.warning(
-                        f"📉 [卖出忽略] 比例虽为 {sell_ratio:.1%}，但预计价值仅 {est_val_sol:.4f} SOL (< 0.01) -> 跳过以节省Gas")
+                        f"📉 [卖出忽略] 比例虽为 {sell_ratio:.1%}，但预计价值仅 {est_val_usdc:.2f} USDC (< 1) -> 跳过以节省 Gas")
                     return
             else:
                 logger.warning(f"⚠️ [卖出跳过] 无法获取 {token_mint} 报价，暂停跟随")
                 return
 
-        # 5. 执行卖出
         logger.info(f"📉 跟随卖出{reason_msg}: {amount_to_sell} (占持仓 {sell_ratio:.2%})")
-        # 🔥 修复：使用关键字参数，确保参数正确传递
-        success, est_sol_out = await self.trader.execute_swap(
+        success, est_out_raw = await self.trader.execute_swap(
             input_mint=token_mint,
-            output_mint=self.trader.SOL_MINT,
+            output_mint=self.trader.QUOTE_MINT,
             amount_lamports=amount_to_sell,
             slippage_bps=SLIPPAGE_SELL
         )
 
         if success:
-            # 🔥 修复：在锁保护下更新持仓
+            est_usdc_out = est_out_raw / (10 ** USDC_DECIMALS)
             async with self.get_token_lock(token_mint):
-                # 再次检查持仓是否存在（可能已被其他线程清仓）
                 if token_mint not in self.portfolio:
                     logger.warning(f"⚠️ [卖出跳过] {token_mint[:6]}... 持仓已被清仓")
-                    est_sol_out_sol = est_sol_out / 10 ** 9
-                    self._record_history("SELL", token_mint, amount_to_sell, est_sol_out_sol)
+                    self._record_history("SELL", token_mint, amount_to_sell, est_usdc_out)
                     return
-                
-                # 🔥 跟卖逻辑：按比例减少余额和成本
-                # 原因：跟卖是跟随大佬卖出，应该按比例减少成本，保持成本与持仓的对应关系
                 my_holdings_before = self.portfolio[token_mint]['my_balance']
-                cost_before = self.portfolio[token_mint]['cost_sol']
-            
+                cost_before = self.portfolio[token_mint].get('cost_usdc', self.portfolio[token_mint].get('cost_sol', 0))
             if my_holdings_before > 0:
-                # 计算卖出比例
                 sell_ratio = amount_to_sell / my_holdings_before
-                
-                # 按比例减少余额和成本
                 self.portfolio[token_mint]['my_balance'] -= amount_to_sell
                 cost_reduction = cost_before * sell_ratio
-                self.portfolio[token_mint]['cost_sol'] = max(0, cost_before - cost_reduction)
-                
+                self.portfolio[token_mint]['cost_usdc'] = max(0, cost_before - cost_reduction)
                 logger.info(
                     f"📉 [跟卖记账] {token_mint[:6]}... 卖出 {sell_ratio:.1%} | "
                     f"余额: {my_holdings_before} -> {self.portfolio[token_mint]['my_balance']} | "
-                    f"成本: {cost_before:.4f} -> {self.portfolio[token_mint]['cost_sol']:.4f} SOL"
+                    f"成本: {cost_before:.2f} -> {self.portfolio[token_mint]['cost_usdc']:.2f} USDC"
                 )
             else:
-                # 如果余额异常（理论上不应该发生），直接删除记录
                 logger.warning(f"⚠️ [异常] {token_mint[:6]}... 卖出时余额异常 ({my_holdings_before})，直接清仓")
                 if token_mint in self.portfolio:
                     del self.portfolio[token_mint]
-                # 直接返回，不继续后续逻辑
                 self._save_portfolio()
-                # 🔥 修复：将 lamports 转换为 SOL 单位
-                est_sol_out_sol = est_sol_out / 10 ** 9
-                self._record_history("SELL", token_mint, amount_to_sell, est_sol_out_sol)
+                self._record_history("SELL", token_mint, amount_to_sell, est_usdc_out)
                 return
 
             # 更新卖出计数缓存
@@ -499,54 +479,33 @@ class PortfolioManager:
             remaining_balance = self.portfolio[token_mint]['my_balance']
             if remaining_balance < 100:
                 del self.portfolio[token_mint]
-                # 🔥 新增：重置该代币的交易计数，防止影响下一次波段
                 if token_mint in self.sell_counts_cache:
                     del self.sell_counts_cache[token_mint]
-                # 买入计数看你策略，通常也可以重置
                 if token_mint in self.buy_counts_cache:
                     del self.buy_counts_cache[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕（成本已归零）")
                 logger.info(f"🧹 正在尝试回收账户租金...")
                 await asyncio.sleep(2)
-                # 🔥 修复：添加异常处理，防止任务失败静默
                 async def safe_close_account():
                     try:
                         await self.trader.close_token_account(token_mint)
                     except Exception as e:
                         logger.error(f"⚠️ 关闭账户失败: {e}")
                 asyncio.create_task(safe_close_account())
-                
-                # 2. 发送【清仓成绩单】邮件 (增强版)
                 try:
-                    # --- A. 算总账 (计算该币种全生命周期的盈亏) ---
                     token_trades = [r for r in self.trade_history if r.get('token') == token_mint]
-                    
-                    # 累计总投入 (BUY)
-                    total_buy_sol = sum(r['value_sol'] for r in token_trades if r['action'] == 'BUY')
-                    
-                    # 累计总回收 (SELL) - 包含刚才那一笔
-                    total_sell_sol = sum(r['value_sol'] for r in token_trades if 'SELL' in r['action'])
-                    
-                    # 净利润 & 收益率
-                    net_profit = total_sell_sol - total_buy_sol
-                    roi = (net_profit / total_buy_sol * 100) if total_buy_sol > 0 else 0
-                    
-                    # --- B. 决定邮件标题和语气 ---
+                    total_buy_usdc = sum(r.get('value_usdc', r.get('value_sol', 0)) for r in token_trades if r['action'] == 'BUY')
+                    total_sell_usdc = sum(r.get('value_usdc', r.get('value_sol', 0)) for r in token_trades if 'SELL' in r['action'])
+                    net_profit = total_sell_usdc - total_buy_usdc
+                    roi = (net_profit / total_buy_usdc * 100) if total_buy_usdc > 0 else 0
                     if net_profit > 0:
                         status_icon = "🚀"
                         status_text = "止盈离场 (Win)"
-                        color_hex = "#4CAF50" # 绿色
                     else:
                         status_icon = "💸"
                         status_text = "止损割肉 (Loss)"
-                        color_hex = "#FF5252" # 红色
-
-                    subject = f"{status_icon} 【清仓报告】{token_mint[:4]}... 结盈: {net_profit:+.4f} SOL ({roi:+.1f}%)"
-
-                    # --- C. 生成交易流水表 ---
+                    subject = f"{status_icon} 【清仓报告】{token_mint[:4]}... 结盈: {net_profit:+.2f} USDC ({roi:+.1f}%)"
                     trade_table = self._generate_trade_history_table(token_mint)
-
-                    # --- D. 组装邮件正文 ---
                     msg = f"""
 ========================================
        🤖 SmartFlow 交易结案报告
@@ -557,10 +516,10 @@ class PortfolioManager:
 
 📊 【最终财务统计】
 ----------------------------------------
-💰 总投入本金:  {total_buy_sol:.4f} SOL
-💵 总回收资金:  {total_sell_sol:.4f} SOL
+💰 总投入本金:  {total_buy_usdc:.2f} USDC
+💵 总回收资金:  {total_sell_usdc:.2f} USDC
 ----------------------------------------
-🔥 净利润 (PnL): {net_profit:+.4f} SOL
+🔥 净利润 (PnL): {net_profit:+.2f} USDC
 📈 投资回报率:  {roi:+.2f}%
 
 📝 【完整操作复盘】
@@ -580,13 +539,9 @@ class PortfolioManager:
                     logger.error(f"构建清仓邮件失败: {e}")
 
             else:
-                # 未清仓，仅日志
                 logger.info(f"📉 [分批卖出] 剩余持仓 {remaining_balance} (未清仓，不发邮件)")
-                
             self._save_portfolio()
-            # 🔥 修复：将 lamports 转换为 SOL 单位
-            est_sol_out_sol = est_sol_out / 10 ** 9
-            self._record_history("SELL", token_mint, amount_to_sell, est_sol_out_sol)
+            self._record_history("SELL", token_mint, amount_to_sell, est_usdc_out)
 
     async def monitor_sync_positions(self):
         """
@@ -656,13 +611,13 @@ class PortfolioManager:
                                         f"✅ [误判恢复] {token_mint[:6]}... 首次检测为0，二次确认后余额: {sm_amount_raw_retry}"
                                     )
                             else:
-                                quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
+                                quote = await self.trader.get_quote(session, token_mint, self.trader.QUOTE_MINT,
                                                                     sm_amount_raw)
                                 if quote:
-                                    val_in_sol = int(quote['outAmount']) / 10 ** 9
-                                    if val_in_sol < 0.05:
+                                    val_in_usdc = int(quote['outAmount']) / (10 ** USDC_DECIMALS)
+                                    if val_in_usdc < 5.0:
                                         should_sell = True
-                                        reason = f"大佬余额价值仅 {val_in_sol:.4f} SOL (判定为粉尘)"
+                                        reason = f"大佬余额价值仅 {val_in_usdc:.2f} USDC (判定为粉尘)"
     
                             if should_sell:
                                 logger.warning(f"😱 发现异常！持有 {token_mint[:6]}... | 原因: {reason}")
@@ -709,33 +664,21 @@ class PortfolioManager:
                                 if token_mint not in self.portfolio:
                                     continue
     
-                            # 询价
-                            quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
+                            quote = await self.trader.get_quote(session, token_mint, self.trader.QUOTE_MINT,
                                                                 data['my_balance'])
-    
                             if quote:
-                                curr_val_lamports = int(quote['outAmount'])
-                                # 🔥 修复：统一单位，将 lamports 转换为 SOL 数量
-                                curr_val_sol = curr_val_lamports / 10 ** 9
-                                cost_sol = data['cost_sol']
-                                # 计算收益率（统一使用 SOL 单位）
-                                roi = (curr_val_sol / cost_sol) - 1 if cost_sol > 0 else 0
-    
-                                # 🔥 触发止盈阈值 (比如 1000%)
+                                curr_val_raw = int(quote['outAmount'])
+                                curr_val_usdc = curr_val_raw / (10 ** USDC_DECIMALS)
+                                cost_usdc = data.get('cost_usdc', data.get('cost_sol', 0))
+                                roi = (curr_val_usdc / cost_usdc) - 1 if cost_usdc > 0 else 0
                                 if roi >= TAKE_PROFIT_ROI:
                                     logger.warning(
                                         f"🚀 [暴富时刻] {token_mint} 收益率达到 {roi * 100:.0f}%！执行“留种”止盈策略...")
-    
-                                    # --- 核心修改：只卖 TAKE_PROFIT_SELL_PCT%，留剩余的和大哥共进退 ---
                                     amount_to_sell = int(data['my_balance'] * TAKE_PROFIT_SELL_PCT)
-    
-                                    # 如果剩下的太少(是粉尘)，干脆全卖了
-                                    # 🔥 修复：使用配置的 TAKE_PROFIT_SELL_PCT 而不是硬编码 0.2
                                     remaining_ratio = 1 - TAKE_PROFIT_SELL_PCT
-                                    est_val_remaining = (curr_val_lamports * remaining_ratio) / 10 ** 9
+                                    est_val_remaining = (curr_val_raw * remaining_ratio) / (10 ** USDC_DECIMALS)
                                     is_clear_all = False
-    
-                                    if est_val_remaining < 0.01:  # 剩下的不值钱，全清
+                                    if est_val_remaining < 1.0:  # 剩余价值过低，全清
                                         amount_to_sell = data['my_balance']
                                         is_clear_all = True
                                         logger.info("   -> 剩余价值过低，执行全仓止盈")
@@ -743,88 +686,51 @@ class PortfolioManager:
                                         logger.info(
                                             f"   -> 锁定 {TAKE_PROFIT_SELL_PCT * 100}% 利润，保留 {(1 - TAKE_PROFIT_SELL_PCT) * 100}% 博百倍金狗！")
     
-                                    # 执行卖出
-                                    # 🔥 修复：使用关键字参数，避免参数顺序错误
-                                    success, est_sol_out = await self.trader.execute_swap(
+                                    success, est_out_raw = await self.trader.execute_swap(
                                         input_mint=token_mint,
-                                        output_mint=self.trader.SOL_MINT,
+                                        output_mint=self.trader.QUOTE_MINT,
                                         amount_lamports=amount_to_sell,
                                         slippage_bps=SLIPPAGE_SELL
                                     )
-    
                                     if success:
-                                        # 🔥 止盈逻辑：只减少余额，不减少成本
-                                        # 原因：止盈是主动止盈，保留成本可以更好地追踪原始投入和真实收益率
-                                        # 只有完全清仓时，成本才会归零
+                                        est_usdc_out = est_out_raw / (10 ** USDC_DECIMALS)
                                         my_holdings_before = self.portfolio[token_mint]['my_balance']
-                                        
-                                        # 先保存剩余仓位（在删除之前）
                                         remaining_balance = my_holdings_before - amount_to_sell
-                                        
-                                        # 只减少余额，成本保持不变（用于追踪原始投入）
                                         if my_holdings_before > 0:
                                             self.portfolio[token_mint]['my_balance'] -= amount_to_sell
                                             logger.info(
                                                 f"💰 [止盈记账] {token_mint[:6]}... 卖出部分止盈 | "
                                                 f"余额: {my_holdings_before} -> {self.portfolio[token_mint]['my_balance']} | "
-                                                f"成本保持: {self.portfolio[token_mint]['cost_sol']:.4f} SOL (用于追踪原始投入)"
+                                                f"成本保持: {self.portfolio[token_mint].get('cost_usdc', 0):.2f} USDC (用于追踪原始投入)"
                                             )
                                         else:
-                                            # 如果余额异常（理论上不应该发生），直接删除记录
                                             logger.warning(f"⚠️ [异常] {token_mint[:6]}... 止盈卖出时余额异常 ({my_holdings_before})，直接清仓")
                                             if token_mint in self.portfolio:
                                                 del self.portfolio[token_mint]
-                                            # 直接返回，不继续后续逻辑
                                             self._save_portfolio()
-                                            # 🔥 修复：将 lamports 转换为 SOL 单位
-                                            est_sol_out_sol = est_sol_out / 10 ** 9
-                                            self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out_sol)
+                                            self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_usdc_out)
                                             return
-    
-                                        # 如果是全清，才删除数据和关账户（成本归零）
                                         if is_clear_all or self.portfolio[token_mint]['my_balance'] <= 0:
                                             if token_mint in self.portfolio:
                                                 del self.portfolio[token_mint]
                                             remaining_balance = 0
-                                            # 🔥 修复：添加异常处理
                                             async def safe_close_account():
                                                 try:
                                                     await self.trader.close_token_account(token_mint)
                                                 except Exception as e:
                                                     logger.error(f"⚠️ 关闭账户失败: {e}")
                                             asyncio.create_task(safe_close_account())
-    
                                         self._save_portfolio()
-                                        # 🔥 修复：将 lamports 转换为 SOL 单位
-                                        est_sol_out_sol = est_sol_out / 10 ** 9
-                                        self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out_sol)
-    
-                                        # 🔥🔥🔥【止盈邮件美化核心代码】🔥🔥🔥
+                                        self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_usdc_out)
                                         try:
-                                            # 1. 计算本次止盈的财务数据
-                                            # 估算本次卖出部分的成本 (按比例分摊总成本)
-                                            total_cost = data['cost_sol'] # 总成本
-                                            # my_holdings_before 是卖出前的持仓量
-                                            cost_of_this_sell = 0.0
-                                            if my_holdings_before > 0:
-                                                cost_of_this_sell = total_cost * (amount_to_sell / my_holdings_before)
-                                            
-                                            # 本次落袋利润
-                                            realized_profit = est_sol_out_sol - cost_of_this_sell
-                                            
-                                            # 2. 计算剩余仓位的价值
-                                            # curr_val_lamports 是当前总价值，est_val_remaining 是剩余部分的价值
-                                            val_remaining_sol = est_val_remaining 
-                                            
-                                            # 3. 计算百分比
+                                            total_cost = data.get('cost_usdc', data.get('cost_sol', 0))
+                                            cost_of_this_sell = total_cost * (amount_to_sell / my_holdings_before) if my_holdings_before > 0 else 0.0
+                                            realized_profit = est_usdc_out - cost_of_this_sell
+                                            val_remaining_usdc = est_val_remaining
                                             sell_pct = TAKE_PROFIT_SELL_PCT * 100
                                             remain_pct = (1 - TAKE_PROFIT_SELL_PCT) * 100
-                                            
-                                            # 4. 生成历史表格
                                             trade_table = self._generate_trade_history_table(token_mint)
-    
-                                            subject = f"🚀 【暴富止盈】{token_mint[:4]}... 锁定利润 {realized_profit:+.4f} SOL"
-    
+                                            subject = f"🚀 【暴富止盈】{token_mint[:4]}... 锁定利润 {realized_profit:+.2f} USDC"
                                             msg = f"""
     ========================================
            🎉 SmartFlow 止盈锁定报告
@@ -836,13 +742,13 @@ class PortfolioManager:
     💰 【本次锁定 (Pocket)】
     ----------------------------------------
     🔨 卖出比例:  {sell_pct:.0f}%
-    💵 到手资金:  {est_sol_out_sol:.4f} SOL
-    🔥 本次净赚:  {realized_profit:+.4f} SOL (已落袋)
+    💵 到手资金:  {est_usdc_out:.2f} USDC
+    🔥 本次净赚:  {realized_profit:+.2f} USDC (已落袋)
     
     💎 【剩余博弈 (Moonbag)】
     ----------------------------------------
     📦 保留仓位:  {remain_pct:.0f}%
-    🦄 当前价值:  {val_remaining_sol:.4f} SOL
+    🦄 当前价值:  {val_remaining_usdc:.2f} USDC
     (成本已大幅收回，剩余仓位零风险格局！)
     
     📝 【交易流水】
@@ -910,58 +816,38 @@ class PortfolioManager:
                             if data['my_balance'] <= 0: 
                                 continue
 
-                            # 询价
                             quote = await self.trader.get_quote(
-                                session, token_mint, self.trader.SOL_MINT, data['my_balance']
+                                session, token_mint, self.trader.QUOTE_MINT, data['my_balance']
                             )
-
                             if quote:
-                                curr_val_lamports = int(quote['outAmount'])
-                                # 🔥 修复：统一单位，将 lamports 转换为 SOL 数量
-                                curr_val_sol = curr_val_lamports / 10 ** 9
-                                cost_sol = data['cost_sol']
+                                curr_val_usdc = int(quote['outAmount']) / (10 ** USDC_DECIMALS)
+                                cost_usdc = data.get('cost_usdc', data.get('cost_sol', 0))
                                 my_balance = data['my_balance']
-                                
-                                # 🔥 计算剩余持仓的平均成本（考虑部分卖出后的成本调整）
-                                # 如果余额为0，跳过（理论上不应该发生，因为上面已经检查过）
                                 if my_balance <= 0:
                                     continue
-                                
-                                # 计算收益率（统一使用 SOL 单位）
-                                # 使用剩余成本计算，反映剩余持仓的真实盈亏情况
-                                roi = (curr_val_sol / cost_sol) - 1 if cost_sol > 0 else 0
-                                
-                                # 记录当前持仓信息（用于日志）
+                                roi = (curr_val_usdc / cost_usdc) - 1 if cost_usdc > 0 else 0
                                 logger.debug(
                                     f"📊 [止损监控] {token_mint[:6]}... | "
-                                    f"当前价值: {curr_val_sol:.4f} SOL | "
-                                    f"剩余成本: {cost_sol:.4f} SOL | "
+                                    f"当前价值: {curr_val_usdc:.2f} USDC | "
+                                    f"剩余成本: {cost_usdc:.2f} USDC | "
                                     f"剩余余额: {my_balance} | "
                                     f"当前ROI: {roi * 100:.1f}%"
                                 )
-
-                                # 🔥 触发止损阈值 (亏损达到 STOP_LOSS_PCT)
                                 if roi <= -STOP_LOSS_PCT:
                                     logger.warning(
                                         f"🛑 [止损触发] {token_mint[:6]}... 亏损达到 {roi * 100:.1f}% "
                                         f"(止损阈值: {STOP_LOSS_PCT * 100:.0f}%)！执行全仓止损卖出...")
-
-                                    # 止损策略：全仓卖出，不留仓位
                                     amount_to_sell = data['my_balance']
-
-                                    # 执行卖出
-                                    # 🔥 修复：使用关键字参数，避免参数顺序错误
-                                    success, est_sol_out = await self.trader.execute_swap(
+                                    success, est_out_raw = await self.trader.execute_swap(
                                         input_mint=token_mint,
-                                        output_mint=self.trader.SOL_MINT,
+                                        output_mint=self.trader.QUOTE_MINT,
                                         amount_lamports=amount_to_sell,
                                         slippage_bps=SLIPPAGE_SELL
                                     )
-
                                     if success:
-                                        # 止损逻辑：全仓卖出，删除持仓记录
+                                        est_usdc_out = est_out_raw / (10 ** USDC_DECIMALS)
                                         my_holdings_before = data['my_balance']
-                                        cost_before = data['cost_sol']
+                                        cost_before = cost_usdc
                                         
                                         # 删除持仓记录（成本归零）
                                         if token_mint in self.portfolio:
@@ -977,10 +863,8 @@ class PortfolioManager:
                                         logger.info(
                                             f"🛑 [止损完成] {token_mint[:6]}... 已全仓止损卖出 | "
                                             f"卖出数量: {my_holdings_before} | "
-                                            f"成本: {cost_before:.4f} SOL"
+                                            f"成本: {cost_before:.2f} USDC"
                                         )
-
-                                        # 尝试关闭账户回收租金
                                         logger.info(f"🧹 正在尝试回收账户租金...")
                                         await asyncio.sleep(2)
                                         async def safe_close_account():
@@ -989,32 +873,16 @@ class PortfolioManager:
                                             except Exception as e:
                                                 logger.error(f"⚠️ 关闭账户失败: {e}")
                                         asyncio.create_task(safe_close_account())
-
                                         self._save_portfolio()
-                                        # 🔥 修复：将 lamports 转换为 SOL 单位
-                                        est_sol_out_sol = est_sol_out / 10 ** 9
-                                        self._record_history("SELL_STOP_LOSS", token_mint, amount_to_sell, est_sol_out_sol)
-
-                                        # 🔥🔥🔥【止损邮件通知】🔥🔥🔥
+                                        self._record_history("SELL_STOP_LOSS", token_mint, amount_to_sell, est_usdc_out)
                                         try:
-                                            # A. 算总账（计算该币种全生命周期的盈亏）
                                             token_trades = [r for r in self.trade_history if r.get('token') == token_mint]
-                                            
-                                            # 累计总投入 (BUY)
-                                            total_buy_sol = sum(r['value_sol'] for r in token_trades if r['action'] == 'BUY')
-                                            
-                                            # 累计总回收 (SELL) - 包含刚才那一笔
-                                            total_sell_sol = sum(r['value_sol'] for r in token_trades if 'SELL' in r['action'])
-                                            
-                                            # 净利润 & 收益率
-                                            net_profit = total_sell_sol - total_buy_sol
-                                            final_roi = (net_profit / total_buy_sol * 100) if total_buy_sol > 0 else 0
-                                            
-                                            # B. 生成交易历史表格
+                                            total_buy_usdc = sum(r.get('value_usdc', r.get('value_sol', 0)) for r in token_trades if r['action'] == 'BUY')
+                                            total_sell_usdc = sum(r.get('value_usdc', r.get('value_sol', 0)) for r in token_trades if 'SELL' in r['action'])
+                                            net_profit = total_sell_usdc - total_buy_usdc
+                                            final_roi = (net_profit / total_buy_usdc * 100) if total_buy_usdc > 0 else 0
                                             trade_table = self._generate_trade_history_table(token_mint)
-
-                                            subject = f"🛑 【止损报告】{token_mint[:4]}... 亏损: {net_profit:+.4f} SOL ({final_roi:+.1f}%)"
-
+                                            subject = f"🛑 【止损报告】{token_mint[:4]}... 亏损: {net_profit:+.2f} USDC ({final_roi:+.1f}%)"
                                             msg = f"""
 ========================================
        🛡️ SmartFlow 止损执行报告
@@ -1026,10 +894,10 @@ class PortfolioManager:
 
 📊 【最终财务统计】
 ----------------------------------------
-💰 总投入本金:  {total_buy_sol:.4f} SOL
-💵 总回收资金:  {total_sell_sol:.4f} SOL
+💰 总投入本金:  {total_buy_usdc:.2f} USDC
+💵 总回收资金:  {total_sell_usdc:.2f} USDC
 ----------------------------------------
-🔥 净利润 (PnL): {net_profit:+.4f} SOL
+🔥 净利润 (PnL): {net_profit:+.2f} USDC
 📉 最终回报率:  {final_roi:+.2f}%
 
 📝 【完整操作复盘】
@@ -1093,25 +961,20 @@ class PortfolioManager:
             logger.warning(f"⚠️ [强平跳过] {token_mint[:6]}... 卖出数量为0")
             return
             
-        # 🔥 修复：使用关键字参数，确保参数正确传递
-        success, est_sol_out = await self.trader.execute_swap(
+        success, est_out_raw = await self.trader.execute_swap(
             input_mint=token_mint,
-            output_mint=self.trader.SOL_MINT,
+            output_mint=self.trader.QUOTE_MINT,
             amount_lamports=amount,
             slippage_bps=SLIPPAGE_SELL
         )
         if success:
-            # 🔥 修复：在锁保护下更新持仓
+            est_usdc_out = est_out_raw / (10 ** USDC_DECIMALS)
             async with self.get_token_lock(token_mint):
                 if token_mint in self.portfolio:
                     del self.portfolio[token_mint]
-
-                # 更新卖出计数 (防止逻辑混乱，强平也算一次卖出)
                 self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
-
             logger.info(f"🧹 [强平] 正在尝试回收账户租金...")
             await asyncio.sleep(2)
-            # 🔥 修复：添加异常处理
             async def safe_close_account():
                 try:
                     await self.trader.close_token_account(token_mint)
@@ -1119,32 +982,21 @@ class PortfolioManager:
                     logger.error(f"⚠️ 关闭账户失败: {e}")
             asyncio.create_task(safe_close_account())
             self._save_portfolio()
-            # 🔥 修复：将 lamports 转换为 SOL 单位
-            est_sol_out_sol = est_sol_out / 10 ** 9
-            self._record_history("SELL_FORCE", token_mint, amount, est_sol_out_sol)
-            
-            # 🔥🔥🔥【邮件美化核心代码】🔥🔥🔥
+            self._record_history("SELL_FORCE", token_mint, amount, est_usdc_out)
             try:
-                # A. 算总账
                 token_trades = [r for r in self.trade_history if r.get('token') == token_mint]
-                total_buy_sol = sum(r['value_sol'] for r in token_trades if r['action'] == 'BUY')
-                total_sell_sol = sum(r['value_sol'] for r in token_trades if 'SELL' in r['action']) # 包含刚才这一笔
-                net_profit = total_sell_sol - total_buy_sol
-                final_roi = (net_profit / total_buy_sol * 100) if total_buy_sol > 0 else 0
-
-                # B. 设定文案
+                total_buy_usdc = sum(r.get('value_usdc', r.get('value_sol', 0)) for r in token_trades if r['action'] == 'BUY')
+                total_sell_usdc = sum(r.get('value_usdc', r.get('value_sol', 0)) for r in token_trades if 'SELL' in r['action'])
+                net_profit = total_sell_usdc - total_buy_usdc
+                final_roi = (net_profit / total_buy_usdc * 100) if total_buy_usdc > 0 else 0
                 if roi == -0.99:
                     reason_title = "🛡️ 触发防断网/大哥清仓风控"
                 else:
                     reason_title = "⚠️ 触发强制止损/其他风控"
-
                 status_icon = "🚀" if net_profit > 0 else "😭"
                 status_text = "盈利离场" if net_profit > 0 else "亏损离场"
-
-                subject = f"{status_icon} 【强平报告】{token_mint[:4]}... 结盈: {net_profit:+.4f} SOL"
-
+                subject = f"{status_icon} 【强平报告】{token_mint[:4]}... 结盈: {net_profit:+.2f} USDC"
                 trade_table = self._generate_trade_history_table(token_mint)
-
                 msg = f"""
 ========================================
        🤖 SmartFlow 风控执行报告
@@ -1156,10 +1008,10 @@ class PortfolioManager:
 
 📊 【最终财务统计】
 ----------------------------------------
-💰 总投入本金:  {total_buy_sol:.4f} SOL
-💵 总回收资金:  {total_sell_sol:.4f} SOL
+💰 总投入本金:  {total_buy_usdc:.2f} USDC
+💵 总回收资金:  {total_sell_usdc:.2f} USDC
 ----------------------------------------
-🔥 净利润 (PnL): {net_profit:+.4f} SOL
+🔥 净利润 (PnL): {net_profit:+.2f} USDC
 📉 最终回报率:  {final_roi:+.2f}%
 
 📝 【完整操作复盘】
@@ -1203,19 +1055,18 @@ class PortfolioManager:
     def _calculate_stats_worker(history_snapshot, yesterday_timestamp):
         temp_holdings = {}
         temp_costs = {}
-        daily_profit_sol = 0.0
-        total_realized_profit_sol = 0.0
+        daily_profit_usdc = 0.0
+        total_realized_profit_usdc = 0.0
         daily_wins = 0
         daily_losses = 0
         total_wins = 0
         total_losses = 0
         COST_THRESHOLD_FOR_WINRATE = 0.01
-
         for record in history_snapshot:
             token = record['token']
             action = record['action']
             amount = record['amount']
-            val = record['value_sol']
+            val = record.get('value_usdc', record.get('value_sol', 0))
             try:
                 rec_time = datetime.strptime(record['time'], "%Y-%m-%d %H:%M:%S")
             except:
@@ -1231,10 +1082,10 @@ class PortfolioManager:
                     avg_price = total_cost / current_holding
                     cost_of_this_sell = avg_price * amount
                     pnl = val - cost_of_this_sell
-                    total_realized_profit_sol += pnl
+                    total_realized_profit_usdc += pnl
                     is_today = rec_time >= yesterday_timestamp
                     if is_today:
-                        daily_profit_sol += pnl
+                        daily_profit_usdc += pnl
                     if cost_of_this_sell > COST_THRESHOLD_FOR_WINRATE:
                         if pnl > 0:
                             total_wins += 1
@@ -1246,8 +1097,8 @@ class PortfolioManager:
                     temp_costs[token] = max(0.0, total_cost - cost_of_this_sell)
 
         return {
-            "daily_profit_sol": daily_profit_sol,
-            "total_realized_profit_sol": total_realized_profit_sol,
+            "daily_profit_usdc": daily_profit_usdc,
+            "total_realized_profit_usdc": total_realized_profit_usdc,
             "daily_wins": daily_wins,
             "daily_losses": daily_losses,
             "total_wins": total_wins,
@@ -1256,25 +1107,17 @@ class PortfolioManager:
         }
 
     async def send_daily_summary(self):
+        """生成每日日报（本币 USDC）。"""
         logger.info("📊 正在生成每日日报...")
         async with aiohttp.ClientSession(trust_env=True) as session:
             try:
-                # 1. 获取基础价格
-                usdc_mint = USDC_MINT
-                quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
-                # 🔥 修复：如果 quote 为 None，使用默认价格或跳过
-                if quote is None:
-                    logger.warning("⚠️ 无法获取 SOL 价格，使用默认价格 $150")
-                    sol_price = 150.0
-                else:
-                    sol_price = float(quote['outAmount']) / 10 ** 6
-
+                wallet = str(self.trader.payer.pubkey())
+                usdc_balance = await self.trader.get_token_balance(wallet, self.trader.QUOTE_MINT)
                 balance_resp = await self.trader.rpc_client.get_balance(self.trader.payer.pubkey())
                 sol_balance = balance_resp.value / 10 ** 9
 
-                # 2. 计算持仓数据 (市值、成本、浮盈、胜负)
-                holdings_val_sol = 0.0
-                holdings_cost_sol = 0.0
+                holdings_val_usdc = 0.0
+                holdings_cost_usdc = 0.0
                 holding_wins = 0
                 holding_losses = 0
                 holdings_count = 0
@@ -1283,43 +1126,30 @@ class PortfolioManager:
                 if self.portfolio:
                     for mint, data in self.portfolio.items():
                         qty = data['my_balance']
-                        cost = data['cost_sol']
+                        cost = data.get('cost_usdc', data.get('cost_sol', 0))
                         if qty > 0:
                             holdings_count += 1
-                            # 询价
-                            q = await self.trader.get_quote(session, mint, self.trader.SOL_MINT, qty)
-                            # 🔥 修复：如果报价失败，使用成本作为估值（避免计算错误）
+                            q = await self.trader.get_quote(session, mint, self.trader.QUOTE_MINT, qty)
                             if q is None:
                                 logger.warning(f"⚠️ 无法获取 {mint[:6]}... 报价，使用成本作为估值")
                                 val = cost
                             else:
-                                val = int(q['outAmount']) / 10 ** 9
-                            
-                            # 累加数据
-                            holdings_val_sol += val
-                            holdings_cost_sol += cost
-                            
-                            # 单个持仓盈亏判定
+                                val = int(q['outAmount']) / (10 ** USDC_DECIMALS)
+                            holdings_val_usdc += val
+                            holdings_cost_usdc += cost
                             pnl = val - cost
                             pnl_pct = (pnl / cost * 100) if cost > 0 else 0
-                            
                             if pnl > 0:
                                 holding_wins += 1
-                                icon = "🟢" # 涨 (红/绿根据习惯，这里用绿代表涨)
+                                icon = "🟢"
                             else:
                                 holding_losses += 1
-                                icon = "🔴" # 跌
-                                
-                            holdings_details += f"{icon} {mint[:4]}..: {val:.3f} SOL ({pnl_pct:+.1f}%)\n"
+                                icon = "🔴"
+                            holdings_details += f"{icon} {mint[:4]}..: {val:.2f} USDC ({pnl_pct:+.1f}%)\n"
 
-                # 计算浮动盈亏 (Unrealized PnL)
-                unrealized_pnl_sol = holdings_val_sol - holdings_cost_sol
+                unrealized_pnl_usdc = holdings_val_usdc - holdings_cost_usdc
+                total_asset_usdc = usdc_balance + holdings_val_usdc
 
-                # 总资产
-                total_asset_sol = sol_balance + holdings_val_sol
-                total_asset_usd = total_asset_sol * sol_price
-
-                # 3. 获取历史已结数据
                 yesterday = datetime.now() - timedelta(days=1)
                 history_snapshot = list(self.trade_history)
                 loop = asyncio.get_event_loop()
@@ -1329,35 +1159,28 @@ class PortfolioManager:
                     history_snapshot,
                     yesterday
                 )
-
-                # 4. 合并数据 (历史 + 持仓)
-                # 真实盈亏 = 已结盈亏 + 浮动盈亏
-                total_net_pnl_sol = stats["total_realized_profit_sol"] + unrealized_pnl_sol
-                total_net_pnl_usd = total_net_pnl_sol * sol_price
-
-                # 综合胜率 = (历史胜单 + 持仓胜单) / (历史总单 + 持仓总数)
+                total_net_pnl_usdc = stats["total_realized_profit_usdc"] + unrealized_pnl_usdc
                 combined_wins = stats["total_wins"] + holding_wins
                 combined_losses = stats["total_losses"] + holding_losses
                 combined_total = combined_wins + combined_losses
                 combined_win_rate = (combined_wins / combined_total * 100) if combined_total > 0 else 0.0
 
-                # 5. 生成报告
                 report = f"""
-【📅 每日资产与盈亏全景】
+【📅 每日资产与盈亏全景】(本币 USDC)
 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 💰 资产总览 (Mark-To-Market):
 -------------------
-• SOL 价格：${sol_price}
-• 钱包余额: {sol_balance:.4f} SOL
-• 持仓市值: {holdings_val_sol:.4f} SOL
-• 资产总值: {total_asset_sol:.4f} SOL (≈ ${total_asset_usd:.0f})
+• 钱包 USDC: {usdc_balance:.2f} USDC
+• 钱包 SOL (Gas): {sol_balance:.4f} SOL
+• 持仓市值: {holdings_val_usdc:.2f} USDC
+• 资产总值: {total_asset_usdc:.2f} USDC
 
 📊 盈亏分析 (含持仓):
 -------------------
-• 历史已结盈亏: {stats['total_realized_profit_sol']:+.4f} SOL
-• 当前浮动盈亏: {unrealized_pnl_sol:+.4f} SOL
-• 账户净盈亏:   {total_net_pnl_sol:+.4f} SOL 🔥
+• 历史已结盈亏: {stats['total_realized_profit_usdc']:+.2f} USDC
+• 当前浮动盈亏: {unrealized_pnl_usdc:+.2f} USDC
+• 账户净盈亏:   {total_net_pnl_usdc:+.2f} USDC 🔥
 
 🏆 综合胜率 (含持仓):
 -------------------

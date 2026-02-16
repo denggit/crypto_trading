@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 @File       : services/solana/trader.py
-@Description: SOL 交易执行模块 (集成 Jito MEV 防夹 + SSL 修复版)
+@Description: Solana 交易执行模块 (本币 USDC，集成 Jito MEV 防夹 + SSL 修复版)
 """
 import base64
 import os
@@ -31,7 +31,8 @@ from config.settings import (
     USE_JITO,
     JITO_TIP_AMOUNT,
     JITO_BLOCK_ENGINE_URL,
-    JITO_TIP_ACCOUNTS
+    JITO_TIP_ACCOUNTS,
+    USDC_MINT,
 )
 from utils.logger import logger
 
@@ -55,8 +56,11 @@ class SolanaTrader:
             logger.error(f"私钥加载失败: {e}")
             raise e
 
+        # 原生 SOL（用于 Gas、Jito 小费、余额检查）
         self.SOL_MINT = "So11111111111111111111111111111111111111112"
-        
+        # 本币：买卖计价与结算使用 USDC
+        self.QUOTE_MINT = USDC_MINT
+
         # 打印配置信息
         logger.info(f"💳 交易钱包已加载: {self.payer.pubkey()}")
         logger.info(f"🔧 Jito 模式: {'✅ 已启用' if USE_JITO else '❌ 已禁用 (使用普通 RPC)'}")
