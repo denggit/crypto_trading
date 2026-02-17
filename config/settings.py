@@ -15,8 +15,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_PATH = BASE_DIR / ".env"
 
 from dotenv import load_dotenv
-
-load_dotenv(dotenv_path=ENV_PATH)
+load_dotenv(dotenv_path=ENV_PATH) 
 
 # --- API Keys ---
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
@@ -43,9 +42,9 @@ TAKE_PROFIT_SELL_PCT = float(os.getenv("TAKE_PROFIT_SELL_PCT", 0.5))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", 0.5))
 
 # --- 风控配置 ---
-MIN_LIQUIDITY_USD = int(os.getenv("MIN_LIQUIDITY_USD", 3000))
-MAX_FDV = int(os.getenv("MAX_FDV", 5000000))
-MIN_FDV = int(os.getenv("MIN_FDV", 0))
+MIN_LIQUIDITY_USD = int(os.getenv("MIN_LIQUIDITY_USD", 3000))           
+MAX_FDV = int(os.getenv("MAX_FDV", 5000000))                            
+MIN_FDV = int(os.getenv("MIN_FDV", 0))                                  
 MIN_SMART_MONEY_COST = float(os.getenv("MIN_SMART_MONEY_COST", 1.0))
 
 # 🛡️ V4 Pro 双重熔断风控机制
@@ -81,31 +80,3 @@ except ValueError:
 
 # --- 币地址 ---
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-
-# --- Jito MEV 防护配置 ---
-# 是否开启 Jito 模式 (默认开启，.env 可覆盖)
-# 开启后，交易将通过 Jito Bundle 发送，防夹且加速
-USE_JITO = os.getenv("USE_JITO", "true").lower() == "true"
-
-# Jito 小费金额 (SOL)
-# 默认 0.0001 SOL，这是一个能保证上链的基础值
-# 如果想抢得更猛，可以在 .env 里改成 0.001 或更高
-JITO_TIP_AMOUNT = float(os.getenv("JITO_TIP_AMOUNT", 0.0001))
-
-# Jito Block Engine URL
-# 针对美西服务器 (硅谷/加州)，推荐使用 SLC (盐湖城) 节点，延迟最低
-# 如果连接不稳定，可以改回主网通用节点: https://mainnet.block-engine.jito.wtf
-JITO_BLOCK_ENGINE_URL = os.getenv("JITO_BLOCK_ENGINE_URL", "https://slc.mainnet.block-engine.jito.wtf/api/v1/bundles")
-
-# Jito 官方小费账户列表 (这些是写死的，全球通用)
-# 交易时会随机选一个转账
-JITO_TIP_ACCOUNTS = [
-    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
-    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopXSjb3uJC66ewJR605UwYJ7r3n",
-    "DfXygSm4jCyNCybVYYK6DwvWqjKkNEqGdQI15a5Q1jvI",
-    "ADuUkR4ykGytmnb5LHydo2iamqrpobyRGmurdZG5iDkD",
-    "DttWaMuVvTiduZRNguLF8983agHzztVXiMVB3yKDhKS5",
-    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnIzKZ6jJ"
-]
