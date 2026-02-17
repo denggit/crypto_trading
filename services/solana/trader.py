@@ -213,9 +213,6 @@ class SolanaTrader:
     async def send_jito_bundle(self, jupiter_tx_bytes):
         """
         🚀 [新增] 发送 Jito Bundle (Jupiter Swap + 小费)
-        
-        Returns:
-            (success: bool, swap_signature: str): 是否成功，Swap 交易签名（用于后续查询）
         """
         try:
             # 1. 解析 Jupiter 返回的交易
@@ -248,16 +245,6 @@ class SolanaTrader:
             # 🔥 注意：Jupiter 返回的交易可能已经部分签名，但我们仍需要用自己的私钥签名
             # 使用 swap_tx.message 重新构建交易，确保使用最新的 blockhash
             signed_swap_tx = VersionedTransaction(swap_tx.message, [self.payer])
-            
-            # 🔥 提取 Swap 交易签名（用于后续查询状态）
-            # 注意：VersionedTransaction 的签名在创建时已经生成，可以直接获取
-            if signed_swap_tx.signatures and len(signed_swap_tx.signatures) > 0:
-                swap_signature = signed_swap_tx.signatures[0]
-                swap_sig_str = str(swap_signature)
-            else:
-                # 如果签名不存在，尝试从消息计算（备用方案）
-                logger.warning("⚠️ 无法从交易中提取签名，将无法查询交易状态")
-                swap_sig_str = None
 
             # 4. 编码为 Base58 (Jito API 要求)
             b58_swap = base58.b58encode(bytes(signed_swap_tx)).decode('utf-8')
@@ -278,77 +265,23 @@ class SolanaTrader:
                     if resp.status != 200:
                         error_text = await resp.text()
                         logger.error(f"❌ Jito API 请求失败 [{resp.status}]: {error_text[:500]}")
-                        return False, None
+                        return False
                     
                     data = await resp.json()
                     if "result" in data:
                         bundle_id = data["result"]
-                        logger.info(f"✅ Jito Bundle 已提交! Bundle ID: {bundle_id}")
-                        if swap_sig_str:
-                            logger.info(f"📝 Swap 交易签名: {swap_sig_str}")
-                            logger.info(f"🔗 查看交易: https://solscan.io/tx/{swap_sig_str}")
-                        return True, swap_sig_str
+                        logger.info(f"✅ Jito Bundle 已提交! ID: {bundle_id}")
+                        return True
                     elif "error" in data:
                         logger.error(f"❌ Jito 发送失败: {data.get('error', {})}")
-                        return False, None
+                        return False
                     else:
                         logger.error(f"❌ Jito 响应格式异常: {data}")
-                        return False, None
+                        return False
 
         except Exception as e:
             logger.error(f"💥 Jito Bundle 构建异常: {e}")
             logger.error(traceback.format_exc())
-            return False, None
-    
-    async def check_transaction_status(self, signature_str, max_retries=10, wait_seconds=3):
-        """
-        检查交易状态
-        
-        Args:
-            signature_str: 交易签名（字符串），如果为 None 则跳过检查
-            max_retries: 最大重试次数
-            wait_seconds: 每次重试等待时间（秒）
-            
-        Returns:
-            bool: 交易是否已确认（如果 signature_str 为 None，返回 True）
-        """
-        if not signature_str:
-            logger.warning("⚠️ 无法检查交易状态（签名不可用）")
-            return True  # 返回 True，让后续的余额检查来确认
-        
-        from solders.signature import Signature
-        
-        try:
-            sig = Signature.from_string(signature_str)
-            
-            for i in range(max_retries):
-                try:
-                    # 查询交易状态
-                    resp = await self.rpc_client.get_signature_statuses([sig])
-                    if resp.value and resp.value[0]:
-                        status = resp.value[0]
-                        if status.confirmation_status:
-                            logger.info(f"✅ 交易已确认! 状态: {status.confirmation_status}")
-                            return True
-                        elif status.err:
-                            logger.error(f"❌ 交易失败: {status.err}")
-                            return False
-                    
-                    # 如果还没确认，等待后重试
-                    if i < max_retries - 1:
-                        logger.info(f"⏳ 交易未确认，等待 {wait_seconds} 秒后重试 ({i+1}/{max_retries})...")
-                        await asyncio.sleep(wait_seconds)
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️ 查询交易状态异常: {e}")
-                    if i < max_retries - 1:
-                        await asyncio.sleep(wait_seconds)
-            
-            logger.warning(f"⚠️ 交易状态查询超时（{max_retries} 次重试），但可能仍在处理中")
-            return False  # 返回 False，但后续仍会检查余额
-            
-        except Exception as e:
-            logger.error(f"❌ 检查交易状态异常: {e}")
             return False
 
     async def execute_swap(self, input_mint, output_mint, amount_lamports, slippage_bps=50):
@@ -403,18 +336,12 @@ class SolanaTrader:
             # --- 分支逻辑：Jito vs 普通 RPC ---
             if USE_JITO:
                 # 🅰️ Jito 模式（带降级机制）
-                success, swap_signature = await self.send_jito_bundle(swap_transaction_buf)
-                if success and swap_signature:
-                    # 🔥 新增：检查交易状态（最多等待 30 秒）
-                    logger.info("⏳ 等待 Jito Bundle 上链确认...")
-                    confirmed = await self.check_transaction_status(swap_signature, max_retries=10, wait_seconds=3)
-                    if confirmed:
-                        logger.info("✅ Jito Bundle 交易已确认上链！")
-                        return True, est_out
-                    else:
-                        logger.warning("⚠️ Jito Bundle 交易未在预期时间内确认，但可能仍在处理中...")
-                        # 即使未确认，也返回成功，让后续的余额检查来最终确认
-                        return True, est_out
+                success = await self.send_jito_bundle(swap_transaction_buf)
+                if success:
+                    # Jito 不返回即时结果，简单等待几秒认为上链
+                    # 真实结果会由 Portfolio 的 sync_real_balance 最终确认
+                    await asyncio.sleep(2)
+                    return True, est_out
                 else:
                     # 🔥 降级机制：Jito 失败时自动降级到普通 RPC
                     logger.warning("⚠️ Jito 发送失败，自动降级到普通 RPC 模式...")

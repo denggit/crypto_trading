@@ -106,9 +106,9 @@ async def test_jito_buy():
             logger.info(f"   ✅ 交易提交成功！")
             logger.info(f"   预计获得代币: {est_out} (原始单位)")
             
-            # Jito Bundle 已经在 execute_swap 中检查了状态，这里再等待一下确保链上数据同步
-            logger.info(f"   ⏳ 等待链上数据同步...")
-            await asyncio.sleep(10)  # 等待 10 秒让链上数据同步
+            # 等待交易确认
+            logger.info(f"   ⏳ 等待交易确认...")
+            await asyncio.sleep(5)  # 等待 5 秒让交易上链
             
         else:
             logger.error(f"   ❌ 交易提交失败！")
@@ -123,17 +123,8 @@ async def test_jito_buy():
     # 5. 验证交易结果
     logger.info("\n🔍 [步骤 5/5] 验证交易结果...")
     try:
-        # 多次检查余额，因为链上数据同步可能需要时间
-        logger.info("   ⏳ 等待链上余额更新（最多等待 30 秒）...")
-        token_balance_after = token_balance_before
-        for i in range(6):  # 最多检查 6 次，每次间隔 5 秒
-            await asyncio.sleep(5)
-            token_balance_after = await trader.get_token_balance(wallet_address, TARGET_TOKEN)
-            balance_change = token_balance_after - token_balance_before
-            logger.info(f"   检查 {i+1}/6: 当前余额 {token_balance_after:.6f}, 变化 {balance_change:+.6f}")
-            if balance_change > 0:
-                logger.info(f"   ✅ 检测到余额变化！")
-                break
+        # 再次检查余额
+        await asyncio.sleep(3)  # 再等 3 秒确保链上数据同步
         
         token_balance_after = await trader.get_token_balance(wallet_address, TARGET_TOKEN)
         logger.info(f"   代币余额 (买入后): {token_balance_after:.6f}")
